@@ -1,0 +1,152 @@
+name: Build Installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Product flavor"
+        required: true
+        default: "home"
+        type: choice
+        options:
+          - home
+          - club-board
+          - club-master
+  push:
+    branches:
+      - main
+      - linux-bringup
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows Installer
+    runs-on: windows-latest
+    env:
+      FLAVOR: ${{ github.event.inputs.flavor || 'home' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      MACHINE_DARTS_TAURI_UPDATER_PUBKEY: ${{ secrets.MACHINE_DARTS_TAURI_UPDATER_PUBKEY }}
+      MACHINE_DARTS_TAURI_ALLOW_UNSIGNED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install backend Python dependencies
+        run: |
+          py -3 -m pip install --upgrade pip
+          py -3 -m pip install -r backend\requirements.txt
+          py -3 -m pip install pyinstaller
+
+      - name: Build Windows flavor
+        shell: powershell
+        run: .\build_release.bat $env:FLAVOR
+
+      - name: Collect Windows artifacts
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path out\windows | Out-Null
+          if (Test-Path frontend\src-tauri\target\release\bundle) {
+            Copy-Item -Recurse -Force frontend\src-tauri\target\release\bundle out\windows\bundle
+          }
+          if (Test-Path ("build\updater\" + $env:FLAVOR)) {
+            Copy-Item -Recurse -Force ("build\updater\" + $env:FLAVOR) out\windows\updater
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ env.FLAVOR }}-${{ github.run_number }}
+          path: out/windows
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux Installer
+    runs-on: ubuntu-22.04
+    env:
+      FLAVOR: ${{ github.event.inputs.flavor || 'home' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      MACHINE_DARTS_TAURI_UPDATER_PUBKEY: ${{ secrets.MACHINE_DARTS_TAURI_UPDATER_PUBKEY }}
+      MACHINE_DARTS_TAURI_ALLOW_UNSIGNED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libfuse2
+
+      - name: Install backend Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r backend/requirements.txt
+          python3 -m pip install pyinstaller
+
+      - name: Make Linux build script executable
+        run: chmod +x ./build_release.sh
+
+      - name: Build Linux flavor
+        run: ./build_release.sh "${FLAVOR}"
+
+      - name: Collect Linux artifacts
+        run: |
+          mkdir -p out/linux
+          if [ -d frontend/src-tauri/target/release/bundle ]; then
+            cp -r frontend/src-tauri/target/release/bundle out/linux/bundle
+          fi
+          if [ -d "build/updater/${FLAVOR}" ]; then
+            cp -r "build/updater/${FLAVOR}" out/linux/updater
+          fi
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ env.FLAVOR }}-${{ github.run_number }}
+          path: out/linux
+          if-no-files-found: error

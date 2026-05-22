@@ -1,0 +1,50 @@
+{
+  "name": "machine-darts-frontend",
+  "version": "1.1.24",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:owner-analytics": "node scripts/dev-owner-analytics.mjs",
+    "dev:home": "vite --mode home",
+    "dev:opencv": "vite --mode opencv",
+    "dev:club-board": "vite --mode club-board",
+    "dev:club-master": "vite --mode club-master",
+    "build": "tsc -b && vite build",
+    "build:home": "tsc -b && vite build --mode home",
+    "build:opencv": "tsc -b && vite build --mode opencv",
+    "build:club-board": "tsc -b && vite build --mode club-board",
+    "build:club-master": "tsc -b && vite build --mode club-master",
+    "preview": "vite preview",
+    "test:online-flow": "node scripts/online-peer-flow-smoke.mjs",
+    "test:online-apply": "python ../backend/tools/online_x01_apply_smoke.py",
+    "tauri": "tauri",
+    "version:set": "node scripts/set-version.mjs",
+    "tauri:build:home": "node scripts/build-tauri-with-updater-pubkey.mjs home",
+    "tauri:build:opencv": "node scripts/build-tauri-with-updater-pubkey.mjs opencv",
+    "tauri:build:club-board": "node scripts/build-tauri-with-updater-pubkey.mjs club-board",
+    "tauri:build:club-master": "node scripts/build-tauri-with-updater-pubkey.mjs club-master"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.103.3",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-updater": "^2.10.0",
+    "framer-motion": "^12.34.2",
+    "lucide-react": "^0.575.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.13.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.0",
+    "@types/node": "^22.19.11",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.31",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
+  }
+}

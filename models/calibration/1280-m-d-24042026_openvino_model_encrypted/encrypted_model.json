@@ -1,0 +1,6 @@
+{
+  "format": "machine-darts-openvino-encrypted-v1",
+  "xml": "1280-m-d-24042026.xml",
+  "bin": "1280-m-d-24042026.bin",
+  "source_model_dir": "1280-m-d-24042026_openvino_model"
+}

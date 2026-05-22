@@ -1,0 +1,51 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { height: 100%; }
+body { margin: 0; overflow-x: hidden; }
+#root { min-height: 100%; }
+
+/* Custom glossy effect classes */
+.glossy-bg {
+  background: linear-gradient(to bottom, rgba(30, 30, 30, 0.8), rgba(10, 10, 10, 0.9));
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.8),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(5px);
+}
+
+.red-glow {
+  text-shadow: 0 0 10px rgba(217, 4, 41, 0.7);
+}
+
+.red-accent {
+  color: #d90429;
+}
+
+.red-accent-2 {
+  color: #dc2626;
+}
+
+/* Custom glossy effect classes */
+.glossy-bg {
+  background: linear-gradient(to bottom, rgba(30, 30, 30, 0.8), rgba(10, 10, 10, 0.9));
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 
+    0 10px 30px rgba(0, 0, 0, 0.8),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(5px);
+}
+
+.red-glow {
+  text-shadow: 0 0 10px rgba(217, 4, 41, 0.7);
+}
+
+.red-accent {
+  color: #d90429;
+}
+
+.red-accent-2 {
+  color: #dc2626;
+}
