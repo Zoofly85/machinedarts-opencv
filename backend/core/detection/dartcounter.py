@@ -71,6 +71,9 @@ STABLE_END_FRAMES_FOR_DETECT = int(max(1, int(os.getenv("MACHINE_DARTS_STABLE_EN
 BEST_DIFF_FRAMES = int(max(1, min(16, int(os.getenv("MACHINE_DARTS_BEST_DIFF_FRAMES", "3")))))
 BEST_DIFF_WINDOW_MS = float(max(0.0, min(1000.0, float(os.getenv("MACHINE_DARTS_BEST_DIFF_WINDOW_MS", "80")))))
 BURST_MASK_MIN_HITS = int(max(1, min(8, int(os.getenv("MACHINE_DARTS_BURST_MASK_MIN_HITS", "2")))))
+FINAL_MASK_DIFF_MODE = str(os.getenv("MACHINE_DARTS_FINAL_MASK_DIFF_MODE", "lab")).strip().lower()
+LAB_DIFF_L_THRESHOLD = int(max(0, min(255, int(os.getenv("MACHINE_DARTS_LAB_DIFF_L_THRESHOLD", "22")))))
+LAB_DIFF_AB_THRESHOLD = int(max(0, min(255, int(os.getenv("MACHINE_DARTS_LAB_DIFF_AB_THRESHOLD", "10")))))
 INSIGHTS_UPDATE_INTERVAL_S = float(os.getenv("MACHINE_DARTS_INSIGHTS_UPDATE_INTERVAL_S", "0.10"))
 RUNTIME_DEBUG_UPDATE_INTERVAL_S = float(os.getenv("MACHINE_DARTS_RUNTIME_DEBUG_UPDATE_INTERVAL_S", "0.20"))
 PRE_TRIGGER_LOG_COOLDOWN_S = float(os.getenv("MACHINE_DARTS_PRE_TRIGGER_LOG_COOLDOWN_S", "0.25"))
@@ -984,6 +987,19 @@ def fast_absdiff_bgr(a: np.ndarray, b: np.ndarray, threshold=DIFF_THRESHOLD) -> 
     percent = float(np.count_nonzero(mask)) / mask.size
     return percent, mask
 
+def lab_diff_mask(current: np.ndarray, reference: np.ndarray) -> Tuple[float, np.ndarray]:
+    """Fast Lab-channel diff mask for final dart-mask extraction."""
+    current_lab = cv2.cvtColor(current, cv2.COLOR_BGR2LAB)
+    reference_lab = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB)
+    diff = cv2.absdiff(current_lab, reference_lab)
+    mask = (
+        (diff[:, :, 0] > LAB_DIFF_L_THRESHOLD)
+        | (diff[:, :, 1] > LAB_DIFF_AB_THRESHOLD)
+        | (diff[:, :, 2] > LAB_DIFF_AB_THRESHOLD)
+    )
+    percent = float(np.count_nonzero(mask)) / mask.size
+    return percent, mask
+
 def sum_of_2_smallest(diff_list):
     vals = sorted([d["percent"] for d in diff_list])
     if not vals: return 0.0
@@ -1045,6 +1061,7 @@ def _capture_best_diff_frames(
     camera_service: CameraService,
     num_cams: int,
     reference_grays: list,
+    reference_frames: list,
     current_frames_raw: list,
     current_frames: list,
     current_grays: list,
@@ -1090,6 +1107,7 @@ def _capture_best_diff_frames(
     best_diffs = []
     for cam_i in range(num_cams):
         ref = reference_grays[cam_i] if cam_i < len(reference_grays) else None
+        ref_frame = reference_frames[cam_i] if cam_i < len(reference_frames) else None
         best_score = -1
         best_mask = None
         mask_hits = None
@@ -1099,8 +1117,11 @@ def _capture_best_diff_frames(
                 score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
                 mask = np.zeros_like(gray, dtype=bool)
             else:
-                diff = cv2.absdiff(gray, ref)
-                mask = diff > diff_threshold_u8
+                if FINAL_MASK_DIFF_MODE == "lab" and ref_frame is not None:
+                    _p, mask = lab_diff_mask(proc_frames[cam_i], ref_frame)
+                else:
+                    diff = cv2.absdiff(gray, ref)
+                    mask = diff > diff_threshold_u8
                 score = float(np.count_nonzero(mask))
                 if mask_hits is None:
                     mask_hits = np.zeros(mask.shape, dtype=np.uint8)
@@ -1112,7 +1133,10 @@ def _capture_best_diff_frames(
                 best_grays[cam_i] = gray
                 best_mask = mask
         if best_mask is None:
-            p, best_mask = fast_absdiff_gray(best_grays[cam_i], ref, diff_threshold_u8) if ref is not None else (0.0, np.zeros_like(best_grays[cam_i], dtype=bool))
+            if ref is not None and FINAL_MASK_DIFF_MODE == "lab" and ref_frame is not None:
+                p, best_mask = lab_diff_mask(best_frames[cam_i], ref_frame)
+            else:
+                p, best_mask = fast_absdiff_gray(best_grays[cam_i], ref, diff_threshold_u8) if ref is not None else (0.0, np.zeros_like(best_grays[cam_i], dtype=bool))
             best_diffs.append({"percent": p, "mask": best_mask})
         else:
             combined_mask = best_mask
@@ -1449,6 +1473,7 @@ def _handle_movement_state(
         camera_service=camera_service,
         num_cams=st.num_cams,
         reference_grays=reference_grays,
+        reference_frames=list(st.before_movement_imgs or []),
         current_frames_raw=frames_raw,
         current_frames=frames,
         current_grays=frames_gray,
