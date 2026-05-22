@@ -1030,11 +1030,11 @@ export default function X01GamePage() {
   const handleGameSyncEvent = useCallback((data: Record<string, any>) => {
     if (data?.event === "dart_score") {
       if (!replayEnabledRef.current) {
-        return false;
+        return true;
       }
       const liveState = x01StateRef.current;
       if (isBotTurn(liveState) || liveState?.turnInputArmed === false) {
-        return false;
+        return true;
       }
       const scoreValue = Number(
         data?.score_value ??
@@ -1070,6 +1070,7 @@ export default function X01GamePage() {
           }
         })();
       }
+      return true;
     }
     if (data?.event === "x01_state_updated" && data?.state) {
       const nextState = data.state as X01State;
@@ -1078,10 +1079,10 @@ export default function X01GamePage() {
       const source = String(data?.source ?? "");
       const botTurn = isBotTurn(nextState);
       if (botTurn || source.startsWith("bot_")) {
-        return false;
+        return true;
       }
       if (!replayEnabledRef.current) {
-        return false;
+        return true;
       }
       const turnTrigger = Math.max(0, Number(replayTurnTriggerScoreRef.current) || 100);
       const checkoutTrigger = Math.max(0, Number(replayCheckoutTriggerScoreRef.current) || 100);
@@ -1170,9 +1171,7 @@ export default function X01GamePage() {
           }
         })();
       }
-      // Keep websocket updates snappy, but still allow a debounced state refresh
-      // so derived flags (e.g. turnInputArmed/bot metadata) stay authoritative.
-      return false;
+      return true;
     }
     return false;
   }, [triggerGifReactionForState]);
