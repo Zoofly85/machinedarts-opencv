@@ -209,6 +209,12 @@ def _resolve_correction_temp_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "correction_temp"
 
 
+def _resolve_regression_debug_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return get_data_root() / "regression_debug"
+    return Path(__file__).resolve().parents[2] / "data" / "regression_debug"
+
+
 def _clear_correction_temp_round(round_session_id: int) -> None:
     root = _resolve_correction_temp_dir() / f"round_{int(round_session_id)}"
     try:
@@ -216,6 +222,68 @@ def _clear_correction_temp_round(round_session_id: int) -> None:
             shutil.rmtree(root)
     except Exception as exc:
         print(f"[WARN] Failed clearing correction temp data {root}: {exc}")
+
+
+def _prune_regression_debug_packs(max_packs: int = 500) -> None:
+    try:
+        root = _resolve_regression_debug_dir() / "correct"
+        if not root.exists():
+            return
+        packs = sorted(
+            [p for p in root.glob("dart_*") if p.is_dir()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in packs[int(max_packs) :]:
+            shutil.rmtree(old, ignore_errors=True)
+    except Exception as exc:
+        print(f"[WARN] Failed pruning regression debug packs: {exc}")
+
+
+def _promote_correct_round_dart_packs(round_session_id: int, entries: list[dict]) -> None:
+    """Persist non-corrected temp packs as the regression set before cleanup."""
+    try:
+        root = _resolve_regression_debug_dir() / "correct"
+        root.mkdir(parents=True, exist_ok=True)
+        for entry in entries:
+            if bool(entry.get("corrected")):
+                continue
+            temp_debug_dir_raw = str(entry.get("temp_debug_dir", "") or "").strip()
+            temp_debug_dir = Path(temp_debug_dir_raw) if temp_debug_dir_raw else None
+            if temp_debug_dir is None or not temp_debug_dir.exists() or not temp_debug_dir.is_dir():
+                continue
+            dart_index = int(entry.get("dart_index", 0) or 0)
+            ts_ms = int(entry.get("ts_ms", int(time.time() * 1000)) or int(time.time() * 1000))
+            target = root / f"dart_{dart_index}_{ts_ms}"
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(temp_debug_dir, target)
+            metadata_path = target / "metadata.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+            except Exception:
+                metadata = {}
+            metadata_text = json.dumps(metadata, default=str).replace(str(temp_debug_dir), str(target))
+            try:
+                metadata = json.loads(metadata_text)
+            except Exception:
+                metadata = {}
+            metadata.update(
+                {
+                    "kind": "score_regression_correct",
+                    "saved_at_ms": int(time.time() * 1000),
+                    "round_session_id": int(round_session_id),
+                    "dart_index": int(dart_index),
+                    "assumed_correct": True,
+                    "original_score_value": int(entry.get("voted_score_value", 0) or 0),
+                    "original_score": entry.get("voted_score") or metadata.get("original_score", {}),
+                    "promoted_from_temp": str(temp_debug_dir),
+                }
+            )
+            metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+        _prune_regression_debug_packs()
+    except Exception as exc:
+        print(f"[WARN] Failed promoting correct regression packs: {exc}")
 
 
 def _write_temp_round_dart_pack(entry: dict) -> str | None:
@@ -663,15 +731,33 @@ def clear_round_dart_history() -> None:
     global _ROUND_DART_SESSION_ID
     with _ROUND_DART_HISTORY_LOCK:
         current_session = int(_ROUND_DART_SESSION_ID)
+        current_entries = [dict(e) for e in _ROUND_DART_HISTORY]
         _PREVIOUS_ROUND_DART_HISTORY[:] = [dict(e) for e in _ROUND_DART_HISTORY]
         _ROUND_DART_HISTORY.clear()
         _ROUND_DART_SESSION_ID = int(_ROUND_DART_SESSION_ID) + 1
+    _promote_correct_round_dart_packs(current_session, current_entries)
     _clear_correction_temp_round(current_session)
 
 
 def get_round_dart_session_id() -> int:
     with _ROUND_DART_HISTORY_LOCK:
         return int(_ROUND_DART_SESSION_ID)
+
+
+def mark_round_dart_corrected(
+    dart_index: int,
+    *,
+    corrected_score_value: int,
+    corrected_score: Optional[dict] = None,
+) -> None:
+    """Mark a scored dart so takeout does not also save it as assumed-correct."""
+    with _ROUND_DART_HISTORY_LOCK:
+        for history in (_ROUND_DART_HISTORY, _PREVIOUS_ROUND_DART_HISTORY):
+            for entry in history:
+                if int(entry.get("dart_index", -1)) == int(dart_index):
+                    entry["corrected"] = True
+                    entry["corrected_score_value"] = int(corrected_score_value)
+                    entry["corrected_score"] = dict(corrected_score or {})
 
 
 def request_detection_reset(*, reset_background: bool = True) -> None:

@@ -1676,6 +1676,12 @@ def correct_score(payload: dict) -> dict:
         score=score_value,
         zone_hint=str(payload.get("zone", "") or ""),
     )
+    if round_entry is not None:
+        dartcounter.mark_round_dart_corrected(
+            dart_index + 1,
+            corrected_score_value=score_value,
+            corrected_score=corrected_score_payload,
+        )
     if round_entry is not None and not is_bouncer:
         try:
             training = _save_correction_training_data(
@@ -1774,6 +1780,12 @@ def add_dart_correction(payload: dict) -> dict[str, Any]:
     )
     round_entry = dartcounter.get_round_dart_result(dart_index + 1, include_previous=True)
     round_session_id = int(round_entry.get("round_session_id", 0)) if round_entry is not None else None
+    if round_entry is not None:
+        dartcounter.mark_round_dart_corrected(
+            dart_index + 1,
+            corrected_score_value=score_value,
+            corrected_score=corrected_score_payload,
+        )
     debug_training: dict[str, Any] = {
         "saved_images": 0,
         "debug_frames": 0,
