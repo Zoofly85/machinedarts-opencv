@@ -215,6 +215,43 @@ def _resolve_regression_debug_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "regression_debug"
 
 
+def _resolve_calibration_data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return get_data_root() / "calibration"
+    return Path(__file__).resolve().parents[2] / "data" / "calibration"
+
+
+def _copy_regression_calibration_snapshot(pack_dir: Path) -> dict:
+    source = _resolve_calibration_data_dir()
+    target = pack_dir / "calibration"
+    summary = {
+        "source_dir": str(source),
+        "target_dir": str(target),
+        "exists": bool(source.exists()),
+        "copied_files": 0,
+        "cameras": [],
+    }
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for camera_dir in sorted(source.glob("camera_*")) if source.exists() else []:
+            if not camera_dir.is_dir():
+                continue
+            target_camera = target / camera_dir.name
+            target_camera.mkdir(parents=True, exist_ok=True)
+            files = []
+            for filename in ("dartboard_calibration.json", "dartboard_calibration.npz"):
+                src = camera_dir / filename
+                if src.exists():
+                    shutil.copy2(src, target_camera / filename)
+                    files.append(filename)
+                    summary["copied_files"] += 1
+            summary["cameras"].append({"camera_dir": camera_dir.name, "files": files})
+    except Exception as exc:
+        summary["error"] = str(exc)
+        print(f"[WARN] Failed copying regression calibration snapshot: {exc}")
+    return summary
+
+
 def _clear_correction_temp_round(round_session_id: int) -> None:
     root = _resolve_correction_temp_dir() / f"round_{int(round_session_id)}"
     try:
@@ -278,6 +315,7 @@ def _promote_correct_round_dart_packs(round_session_id: int, entries: list[dict]
                     "original_score_value": int(entry.get("voted_score_value", 0) or 0),
                     "original_score": entry.get("voted_score") or metadata.get("original_score", {}),
                     "promoted_from_temp": str(temp_debug_dir),
+                    "calibration_snapshot": _copy_regression_calibration_snapshot(target),
                 }
             )
             metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")

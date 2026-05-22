@@ -112,6 +112,8 @@ def main() -> int:
             continue
         meta = json.loads((pack / "metadata.json").read_text(encoding="utf-8"))
         corrected = meta.get("corrected_score") if isinstance(meta.get("corrected_score"), dict) else None
+        if corrected is None and bool(meta.get("assumed_correct")):
+            corrected = meta.get("original_score") if isinstance(meta.get("original_score"), dict) else None
         corrected_key = _norm_key(corrected)
         if corrected_key is None:
             continue
