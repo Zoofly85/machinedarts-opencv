@@ -1010,6 +1010,8 @@ def _handle_dart_detected(
     frames_raw: list,
     background_frames_raw: list,
     burst_frames_raw: list | None,
+    movement_started_at: Optional[float],
+    detect_capture_ms: float,
     tip_jobs: Queue,
     current_tip_session,
 ) -> None:
@@ -1020,6 +1022,8 @@ def _handle_dart_detected(
         frames_raw=frames_raw,
         background_frames_raw=background_frames_raw,
         burst_frames_raw=burst_frames_raw,
+        movement_started_at=movement_started_at,
+        detect_capture_ms=detect_capture_ms,
         tip_jobs=tip_jobs,
         current_tip_session=current_tip_session,
         sum_of_2_largest=sum_of_2_largest,
@@ -1316,6 +1320,7 @@ def _handle_movement_state(
         return threshold_log_last
     reference_grays = list(st.before_movement_grays or [])
     reference_raw_frames = list(raw_before_movement_imgs)
+    capture_t0 = time.perf_counter()
     best_raw, best_frames, best_grays, best_diffs, burst_frames_raw = _capture_best_diff_frames(
         camera_service=camera_service,
         num_cams=st.num_cams,
@@ -1325,6 +1330,7 @@ def _handle_movement_state(
         current_grays=frames_gray,
         diff_threshold_u8=diff_threshold_u8,
     )
+    detect_capture_ms = (time.perf_counter() - capture_t0) * 1000.0
     diffs = best_diffs
     frames = best_frames
     frames_gray = best_grays
@@ -1426,6 +1432,8 @@ def _handle_movement_state(
         frames_raw=frames_raw,
         background_frames_raw=reference_raw_frames,
         burst_frames_raw=burst_frames_raw,
+        movement_started_at=st.movement_started_at,
+        detect_capture_ms=detect_capture_ms,
         tip_jobs=tip_jobs,
         current_tip_session=current_tip_session,
     )

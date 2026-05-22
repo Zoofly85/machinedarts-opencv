@@ -16,6 +16,8 @@ def handle_dart_detected_side_effects(
     frames_raw: list,
     background_frames_raw: list,
     burst_frames_raw: list | None,
+    movement_started_at: Optional[float],
+    detect_capture_ms: float,
     tip_jobs: Queue,
     current_tip_session: Callable[[], int],
     sum_of_2_largest: Callable[[list], float],
@@ -29,6 +31,11 @@ def handle_dart_detected_side_effects(
     st.last_dart_detection_time = time.perf_counter() * 1000.0
     event_t0 = time.perf_counter()
     event_wall_ts_ms = int(time.time() * 1000)
+    movement_to_detect_ms = (
+        (event_t0 - float(movement_started_at)) * 1000.0
+        if movement_started_at is not None
+        else None
+    )
     # Freeze the scoring/replay snapshot before notifying other listeners so
     # downstream event work cannot delay the captured frame.
     snapshot_frames = [f.copy() if isinstance(f, np.ndarray) else None for f in frames_raw]
@@ -52,6 +59,9 @@ def handle_dart_detected_side_effects(
         "burst_frames": burst_frames,
         "masks": snapshot_masks,
         "event_t0": event_t0,
+        "movement_started_at": movement_started_at,
+        "movement_to_detect_ms": movement_to_detect_ms,
+        "detect_capture_ms": float(detect_capture_ms or 0.0),
         "event_wall_ts_ms": event_wall_ts_ms,
         "session": current_tip_session(),
         "dart_index": st.dart_count,
@@ -76,6 +86,8 @@ def handle_dart_detected_side_effects(
             "detection_counter": st.detection_counter,
             "darts_on_board": st.dart_count,
             "ts_ms": event_wall_ts_ms,
+            "movement_to_detect_ms": round(movement_to_detect_ms, 2) if movement_to_detect_ms is not None else None,
+            "detect_capture_ms": round(float(detect_capture_ms or 0.0), 2),
         }
     )
 
@@ -100,6 +112,13 @@ def process_tip_score_job(
     tip_result = tip_scorer.score_masks(job.get("masks") or [], dart_index=int(job.get("dart_index", 0)))
     proc_ms = (time.perf_counter() - proc_t0) * 1000.0
     total_ms = (time.perf_counter() - float(job["event_t0"])) * 1000.0
+    queue_wait_ms = (proc_t0 - float(job["event_t0"])) * 1000.0
+    movement_started_at = job.get("movement_started_at")
+    hit_to_score_ms = (
+        (time.perf_counter() - float(movement_started_at)) * 1000.0
+        if movement_started_at is not None
+        else None
+    )
 
     if job_session != current_tip_session():
         return
@@ -120,6 +139,12 @@ def process_tip_score_job(
             except Exception:
                 pass
     timing_suffix = f", {' '.join(timing_bits)}" if timing_bits else ""
+    detect_suffix = (
+        f", detect={float(job.get('movement_to_detect_ms') or 0.0):.1f}"
+        f" capture={float(job.get('detect_capture_ms') or 0.0):.1f}"
+        f" queue={queue_wait_ms:.1f}"
+        + (f" hit_to_score={hit_to_score_ms:.1f}" if hit_to_score_ms is not None else "")
+    )
 
     if bool(tip_result.get("ok")):
         selected_new_tips = tip_result.get("selected_new_tips", [])
@@ -136,7 +161,7 @@ def process_tip_score_job(
         print(
             f"[OPENCV] score -> {voted_value} "
             f"(votes={votes}, zone={voted_score.get('zone', '-')}, "
-            f"proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{timing_suffix}{miss_suffix})"
+            f"proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{detect_suffix}{timing_suffix}{miss_suffix})"
         )
 
         if dart_index > 0:
@@ -192,7 +217,7 @@ def process_tip_score_job(
     reason = str(tip_result.get("reason", "unknown"))
     print(
         f"[OPENCV] score unavailable "
-        f"({reason}, proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{timing_suffix})"
+        f"({reason}, proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{detect_suffix}{timing_suffix})"
     )
     update_detection_insights(
         last_tip_scoring_ms=round(proc_ms, 2),
