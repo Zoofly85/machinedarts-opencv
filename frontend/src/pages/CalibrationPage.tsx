@@ -60,7 +60,9 @@ interface CameraDevice {
   fps?: number;
   backend?: string;
   label?: string;
+  os_label?: string;
   device_id?: string | null;
+  identity_verified?: boolean;
 }
 
 interface FocusMetrics {
@@ -199,9 +201,8 @@ export default function CalibrationPage({ embedded = false }: { embedded?: boole
     if (device.label) {
       parts.push(device.label);
     }
-    const shortId = shortDeviceId(device);
-    if (shortId) {
-      parts.push(`ID ${shortId}`);
+    if (device.identity_verified && device.os_label) {
+      parts.push(device.os_label);
     }
     parts.push(device.available ? "Ready" : (device.status || "Unavailable"));
     if (device.width && device.height) {
@@ -227,10 +228,10 @@ export default function CalibrationPage({ embedded = false }: { embedded?: boole
   };
 
   const formatDeviceOption = (device: CameraDevice) => {
-    const shortId = shortDeviceId(device);
     const label = device.label || `Device ${device.index}`;
     const status = device.available ? "" : " (not detected)";
-    return `Device ${device.index} - ${label}${shortId ? ` - ID ${shortId}` : ""}${status}`;
+    const osLabel = device.identity_verified && device.os_label ? ` - ${device.os_label}` : "";
+    return `Device ${device.index} - ${label}${osLabel}${status}`;
   };
 
   const normalizePlayerRotation = (value: unknown) => {
@@ -425,12 +426,28 @@ export default function CalibrationPage({ embedded = false }: { embedded?: boole
         throw new Error(errorData.detail || "Failed to update camera selection.");
       }
 
+      const data = await response.json().catch(() => ({}));
+      const readySlots = data?.scoring_ready && typeof data.scoring_ready === "object"
+        ? Object.values(data.scoring_ready).filter(Boolean).length
+        : null;
+      const scoringSlotCount = cameras.filter((camera) => camera.calibratable !== false).length || 3;
       setSelectionMessage({
         type: "success",
-        text: "Camera selection applied. Detection was reset; recalibrate any changed slots.",
+        text: data?.requires_restart
+          ? (data?.message || "Camera selection saved. Restart the backend to apply this scoring/player camera change.")
+          : readySlots === null
+          ? "Camera selection applied. Detection was reset; recalibrate any changed slots."
+          : `Camera selection applied. ${readySlots}/${scoringSlotCount} scoring cameras are live; detection was reset.`,
       });
       await fetchCameras();
       await fetchCameraDevices();
+      if (!data?.requires_restart) {
+        window.setTimeout(() => {
+          if (document.visibilityState === "visible") {
+            connectToWebSocket();
+          }
+        }, 250);
+      }
     } catch (err: any) {
       console.error("Error saving camera selection:", err);
       setSelectionMessage({ type: "error", text: err.message || "Failed to save camera selection." });

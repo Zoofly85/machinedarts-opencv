@@ -41,10 +41,12 @@ class CameraService:
         self._cap_lock = threading.Lock()
         self._switch_lock = threading.RLock()
         self._switching = threading.Event()
+        self._maintenance = threading.Event()
         self._running = threading.Event()
         self._threads: dict[int, threading.Thread] = {}
         self._optional_missing_slots: set[int] = set()
         self._slot_errors: dict[int, str] = {}
+        self._config_generation = 0
 
         # Simple global mode lock so detection and calibration can coordinate.
         self._mode_lock = threading.Lock()
@@ -75,7 +77,7 @@ class CameraService:
         platform_name = self._platform_name()
         names: list[str]
         if platform_name == "windows":
-            names = ["CAP_DSHOW"]
+            names = ["CAP_DSHOW", "CAP_MSMF", "CAP_ANY"]
         elif platform_name == "linux":
             names = ["CAP_V4L2", "CAP_ANY"]
         elif platform_name == "macos":
@@ -95,7 +97,7 @@ class CameraService:
     def _codec_candidates(self) -> list[str | None]:
         platform_name = self._platform_name()
         if platform_name == "windows":
-            return ["MJPG"]
+            return ["MJPG", "YUY2", None]
         if platform_name == "linux":
             # Linux cams typically expose MJPG/YUYV via V4L2; fallback to driver default.
             return ["MJPG", "YUYV", "UYVY", None]
@@ -112,8 +114,6 @@ class CameraService:
             or ""
         ).strip().lower()
         if raw in {"1", "true", "yes", "on"}:
-            return True
-        if self._platform_name() == "windows" and required:
             return True
         return False
 
@@ -423,15 +423,22 @@ class CameraService:
     def _stop_capture_threads_locked(self) -> None:
         self._switching.set()
         self._running.clear()
-        threads = list(self._threads.values())
-        for thread in threads:
-            thread.join(timeout=0.75)
-        self._threads.clear()
+        thread_items = list(self._threads.items())
+        for _, thread in thread_items:
+            thread.join(timeout=2.5)
+        alive = {cam_idx: thread for cam_idx, thread in thread_items if thread.is_alive()}
+        if alive:
+            cams = ", ".join(str(int(cam_idx)) for cam_idx in sorted(alive))
+            raise RuntimeError(f"Timed out waiting for camera capture threads to stop: {cams}")
         with self._cap_lock:
-            for cap in self._caps.values():
+            for cam_idx, cap in list(self._caps.items()):
                 if cap is not None:
-                    cap.release()
-            self._caps.clear()
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                self._caps.pop(cam_idx, None)
+            self._threads.clear()
 
     def _start_capture_threads_locked(self) -> None:
         if self._running.is_set():
@@ -473,59 +480,67 @@ class CameraService:
 
     def _capture_loop(self, slot: int, cam_idx: int, required: bool) -> None:
         last_read_error_log_ms = 0
-        while self._running.is_set():
-            cap = None
-            with self._cap_lock:
-                cap = self._caps.get(cam_idx)
+        try:
+            while self._running.is_set():
+                cap = None
+                with self._cap_lock:
+                    cap = self._caps.get(cam_idx)
+                    if cap is None:
+                        cap = self._open_camera(cam_idx, required=required)
+                        self._caps[cam_idx] = cap
+
                 if cap is None:
-                    cap = self._open_camera(cam_idx, required=required)
-                    self._caps[cam_idx] = cap
+                    if not required:
+                        self._optional_missing_slots.add(slot)
+                        return
+                    if self._strict_scoring_camera_open(required=True):
+                        with self._cap_lock:
+                            self._slot_errors[int(slot)] = (
+                                f"Device {int(cam_idx)} failed strict DSHOW/MJPG open. "
+                                "Open Camera Selection and assign a valid scoring camera."
+                            )
+                        return
+                    time.sleep(0.2)
+                    continue
 
-            if cap is None:
-                if not required:
-                    self._optional_missing_slots.add(slot)
-                    with self._cap_lock:
-                        self._threads.pop(cam_idx, None)
-                    return
-                if self._strict_scoring_camera_open(required=True):
-                    with self._cap_lock:
-                        self._slot_errors[int(slot)] = (
-                            f"Device {int(cam_idx)} failed strict DSHOW/MJPG open. "
-                            "Open Camera Selection and assign a valid scoring camera."
-                        )
-                        self._threads.pop(cam_idx, None)
-                    return
-                time.sleep(0.2)
-                continue
+                try:
+                    ok, frame = cap.read()
+                except cv2.error as exc:
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - last_read_error_log_ms > 2000:
+                        print(f"[WARN] Camera {cam_idx} read failed ({exc}); reopening camera")
+                        last_read_error_log_ms = now_ms
+                    ok, frame = False, None
+                except Exception as exc:
+                    now_ms = int(time.time() * 1000)
+                    if now_ms - last_read_error_log_ms > 2000:
+                        print(f"[WARN] Camera {cam_idx} read exception ({exc}); reopening camera")
+                        last_read_error_log_ms = now_ms
+                    ok, frame = False, None
+                if ok and frame is not None:
+                    with self._latest_lock:
+                        self._latest_frames[cam_idx] = frame
+                        self._latest_frame_ms[cam_idx] = int(time.time() * 1000)
+                    continue
 
-            try:
-                ok, frame = cap.read()
-            except cv2.error as exc:
-                # Keep capture threads alive on transient OpenCV failures
-                # (including occasional OutOfMemory errors from backend drivers).
-                now_ms = int(time.time() * 1000)
-                if now_ms - last_read_error_log_ms > 2000:
-                    print(f"[WARN] Camera {cam_idx} read failed ({exc}); reopening camera")
-                    last_read_error_log_ms = now_ms
-                ok, frame = False, None
-            except Exception as exc:
-                now_ms = int(time.time() * 1000)
-                if now_ms - last_read_error_log_ms > 2000:
-                    print(f"[WARN] Camera {cam_idx} read exception ({exc}); reopening camera")
-                    last_read_error_log_ms = now_ms
-                ok, frame = False, None
-            if ok and frame is not None:
-                with self._latest_lock:
-                    self._latest_frames[cam_idx] = frame
-                    self._latest_frame_ms[cam_idx] = int(time.time() * 1000)
-                continue
-
+                with self._cap_lock:
+                    bad_cap = self._caps.get(cam_idx)
+                    if bad_cap is not None:
+                        try:
+                            bad_cap.release()
+                        except Exception:
+                            pass
+                    self._caps[cam_idx] = None
+                time.sleep(0.1)
+        finally:
             with self._cap_lock:
-                bad_cap = self._caps.get(cam_idx)
-                if bad_cap is not None:
-                    bad_cap.release()
-                self._caps[cam_idx] = None
-            time.sleep(0.1)
+                cap = self._caps.pop(cam_idx, None)
+                self._threads.pop(cam_idx, None)
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
     def list_cameras(self) -> list[CameraInfo]:
         self.start()
@@ -560,7 +575,7 @@ class CameraService:
             return out
 
     def get_latest_frame(self, camera_slot: int, copy: bool = True) -> np.ndarray | None:
-        if self._switching.is_set():
+        if self._switching.is_set() or self._maintenance.is_set():
             return None
         self.start()
         if camera_slot < 0 or camera_slot >= len(self.indices):
@@ -574,7 +589,7 @@ class CameraService:
             return frame.copy() if copy else frame
 
     def get_latest_frame_info(self, camera_slot: int, copy: bool = True) -> tuple[np.ndarray | None, int | None]:
-        if self._switching.is_set():
+        if self._switching.is_set() or self._maintenance.is_set():
             return None, None
         self.start()
         if camera_slot < 0 or camera_slot >= len(self.indices):
@@ -603,6 +618,31 @@ class CameraService:
             time.sleep(0.01)
         return None
 
+    def wait_for_configured_frames(self, *, timeout_s: float = 2.0, scoring_only: bool = True) -> dict[int, bool]:
+        slots = [
+            slot
+            for slot in range(len(self.indices))
+            if not scoring_only or is_scoring_camera_slot(slot)
+        ]
+        readiness = {slot: False for slot in slots}
+        deadline = time.perf_counter() + max(0.0, timeout_s)
+        self.start()
+        while time.perf_counter() < deadline:
+            for slot in slots:
+                if readiness[slot]:
+                    continue
+                if slot < 0 or slot >= len(self.indices):
+                    continue
+                cam_idx = self._slot_to_index.get(slot)
+                with self._latest_lock:
+                    frame = self._latest_frames.get(cam_idx) if cam_idx is not None else None
+                    ts_ms = self._latest_frame_ms.get(cam_idx) if cam_idx is not None else None
+                readiness[slot] = frame is not None and ts_ms is not None
+            if all(readiness.values()):
+                break
+            time.sleep(0.02)
+        return readiness
+
     def read_frame(self, camera_slot: int) -> np.ndarray | None:
         """Compatibility shim for existing callers."""
         return self.get_latest_frame(camera_slot, copy=True)
@@ -623,8 +663,18 @@ class CameraService:
 
     def mode_status(self) -> dict[str, str | None]:
         with self._mode_lock:
-            mode = "switching" if self._switching.is_set() else self._active_mode
+            mode = "switching" if self._switching.is_set() or self._maintenance.is_set() else self._active_mode
             return {"mode": mode, "owner": self._active_mode_owner}
+
+    def configuration_generation(self) -> int:
+        with self._switch_lock:
+            return int(self._config_generation)
+
+    def begin_maintenance(self) -> None:
+        self._maintenance.set()
+
+    def end_maintenance(self) -> None:
+        self._maintenance.clear()
 
     def close(self) -> None:
         with self._switch_lock:
@@ -641,17 +691,39 @@ class CameraService:
             raise ValueError("indices must be unique")
 
         with self._switch_lock:
+            scoring_count = min(DEFAULT_SCORING_CAMERA_COUNT, len(normalized), len(self.indices))
+            old_scoring = [int(idx) for idx in self.indices[:scoring_count]]
+            new_scoring = [int(idx) for idx in normalized[:scoring_count]]
+            can_logical_remap = (
+                len(old_scoring) == len(new_scoring)
+                and set(old_scoring) == set(new_scoring)
+                and all(idx in self._caps and self._caps.get(idx) is not None for idx in new_scoring)
+            )
+            if can_logical_remap:
+                self._switching.set()
+                try:
+                    self.indices = normalized
+                    self._slot_to_index = {slot: cam_idx for slot, cam_idx in enumerate(self.indices)}
+                    self._config_generation += 1
+                    with self._latest_lock:
+                        self._latest_frames = {idx: self._latest_frames.get(idx) for idx in self.indices}
+                        self._latest_frame_ms = {idx: self._latest_frame_ms.get(idx) for idx in self.indices}
+                    print(f"[camera] Applied logical camera slot remap without reopening devices: {normalized}")
+                    return
+                finally:
+                    self._switching.clear()
+
             was_running = self._running.is_set()
             try:
                 self._stop_capture_threads_locked()
                 self.indices = normalized
                 self._slot_to_index = {slot: cam_idx for slot, cam_idx in enumerate(self.indices)}
+                self._config_generation += 1
                 self._optional_missing_slots.clear()
                 with self._latest_lock:
                     self._latest_frames = {idx: None for idx in self.indices}
                     self._latest_frame_ms = {idx: None for idx in self.indices}
+                if was_running:
+                    self._start_capture_threads_locked()
             finally:
                 self._switching.clear()
-
-            if was_running:
-                self._start_capture_threads_locked()

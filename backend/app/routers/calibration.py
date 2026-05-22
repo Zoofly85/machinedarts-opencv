@@ -22,6 +22,7 @@ from backend.config.settings import (
 from backend.core.calibration_manager import get_shared_calibration_manager
 from backend.core.camera_service import CameraService
 from backend.core.calibration_point_detector import CalibrationPointDetector
+from backend.core.detection_events import publish_detection_event
 from backend.core.firebase_uploader import FirebaseUploader
 from backend.core.player_replay_camera import get_player_replay_camera_service
 from backend.models.schemas import RotationRequest, ScoreRequest
@@ -358,17 +359,27 @@ def get_camera_service_status() -> dict:
 @router.get("/api/camera/devices")
 def get_camera_devices(max_devices: int = 20) -> dict:
     cameras = camera_service.list_cameras()
-    mode_status = camera_service.mode_status()
-    active_mode = str(mode_status.get("mode") or "")
     max_devices = max(1, min(int(max_devices), 32))
     device_identities = enumerate_camera_device_identities(max_devices)
-    device_labels = {
-        int(idx): str(info.get("label") or f"Device {idx}")
-        for idx, info in device_identities.items()
-    }
     devices_by_index: dict[int, dict] = {}
+    selected_indices = [int(idx) for idx in settings.camera_indices]
+    selected_index_set = set(selected_indices)
+    player_replay_status = get_player_replay_camera_service().get_status()
+    player_device_index = player_replay_status.get("camera_index")
+    try:
+        player_device_index = None if player_device_index is None else int(player_device_index)
+    except Exception:
+        player_device_index = None
+
+    def _device_label(index: int) -> str:
+        return f"OpenCV Device {int(index)}"
+
+    def _os_identity(index: int) -> dict | None:
+        return device_identities.get(int(index))
 
     def _open_device_probe(index: int):
+        if int(index) in selected_index_set:
+            return None
         if sys.platform.startswith("win"):
             try:
                 return cv2.VideoCapture(
@@ -390,49 +401,50 @@ def get_camera_devices(max_devices: int = 20) -> dict:
         return cv2.VideoCapture(int(index))
 
     for idx in range(max_devices):
-        opened = False
+        cap = _open_device_probe(idx)
+        opened = bool(cap is not None and cap.isOpened())
         width = height = None
         fps = None
-        # Do not probe cameras by opening new VideoCapture handles while the
-        # detector owns the scoring cameras. On Windows/USB this can crash or
-        # knock existing DSHOW/MJPG streams offline.
-        if active_mode != "detection":
-            cap = _open_device_probe(idx)
-            opened = bool(cap is not None and cap.isOpened())
-            if opened:
-                try:
-                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
-                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
-                    fps_raw = float(cap.get(cv2.CAP_PROP_FPS))
-                    fps = round(fps_raw, 2) if fps_raw > 0 else None
-                except Exception:
-                    pass
-            if cap is not None:
-                cap.release()
+        if opened:
+            try:
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+                fps_raw = float(cap.get(cv2.CAP_PROP_FPS))
+                fps = round(fps_raw, 2) if fps_raw > 0 else None
+            except Exception:
+                pass
+        if cap is not None:
+            cap.release()
         devices_by_index[idx] = {
             "index": idx,
-            "available": opened,
-            "status": "ready" if opened else ("in_use" if active_mode == "detection" else "unavailable"),
+            "available": opened or int(idx) in selected_index_set,
+            "status": "ready" if opened else ("in_use" if int(idx) in selected_index_set else "unavailable"),
             "width": width or settings.camera_width,
             "height": height or settings.camera_height,
             "fps": fps or settings.camera_fps,
             "backend": camera_service.backend_hint_label(),
-            "label": device_labels.get(idx) or f"Device {idx}",
-            "device_id": (device_identities.get(idx) or {}).get("device_id"),
+            "label": _device_label(idx),
+            "os_label": (_os_identity(idx) or {}).get("label"),
+            "device_id": (_os_identity(idx) or {}).get("device_id"),
+            "identity_verified": False,
         }
 
     for c in cameras:
         physical_index = int(c.index)
+        is_player_device = player_device_index is not None and int(physical_index) == int(player_device_index)
+        player_live = is_player_device and player_replay_status.get("last_frame_ms") is not None
         devices_by_index[int(c.index)] = {
             "index": physical_index,
-            "available": bool(c.opened),
-            "status": "ready" if c.opened else "unavailable",
+            "available": bool(c.opened) or is_player_device,
+            "status": "ready" if c.opened else ("preview" if player_live else ("in_use" if is_player_device else "unavailable")),
             "width": c.width or settings.camera_width,
             "height": c.height or settings.camera_height,
             "fps": c.fps or settings.camera_fps,
             "backend": c.backend or camera_service.backend_hint_label(),
-            "label": device_labels.get(physical_index) or f"Device {physical_index}",
-            "device_id": (device_identities.get(physical_index) or {}).get("device_id"),
+            "label": _device_label(physical_index),
+            "os_label": (_os_identity(physical_index) or {}).get("label"),
+            "device_id": (_os_identity(physical_index) or {}).get("device_id"),
+            "identity_verified": False,
         }
     devices = sorted(devices_by_index.values(), key=lambda d: int(d.get("index", 0)))
     return {"devices": devices, "selected": settings.camera_indices}
@@ -456,15 +468,57 @@ def select_camera_devices(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="camera indices must be >= 0")
     if len(set(normalized)) != len(normalized):
         raise HTTPException(status_code=400, detail="camera indices must be unique")
+    readiness: dict[int, bool] = {}
+    player_replay_status: dict = {}
     try:
-        camera_service.reconfigure_indices(normalized)
-        set_camera_indices(normalized, persist=True)
+        previous_indices = [int(idx) for idx in settings.camera_indices]
+        dartcounter = None
+        publish_detection_event(
+            {
+                "type": "camera_selection_changing",
+                "previous_indices": previous_indices,
+                "next_indices": normalized,
+            }
+        )
         try:
-            from backend.core.detection import dartcounter
+            camera_service.begin_maintenance()
+            try:
+                from backend.core.detection import dartcounter
 
-            dartcounter.request_detection_reset(reset_background=True)
-        except Exception as exc:
-            print(f"[WARN] Detection reset after camera selection failed: {exc}")
+                dartcounter.request_detection_reset(reset_background=True)
+            except Exception as exc:
+                print(f"[WARN] Detection pre-reset before camera selection failed: {exc}")
+            time.sleep(0.25)
+            try:
+                get_player_replay_camera_service().close()
+            except Exception as exc:
+                print(f"[WARN] Player Cam close before camera selection failed: {exc}")
+            camera_service.reconfigure_indices(normalized)
+            set_camera_indices(normalized, persist=True)
+            readiness = camera_service.wait_for_configured_frames(timeout_s=3.5, scoring_only=True)
+            try:
+                if dartcounter is None:
+                    from backend.core.detection import dartcounter
+
+                dartcounter.request_detection_reset(reset_background=True)
+                player_replay_status = get_player_replay_camera_service().configure_from_settings(
+                    dartcounter.get_detection_settings()
+                )
+            except Exception as exc:
+                print(f"[WARN] Detection reset after camera selection failed: {exc}")
+                player_replay_status = get_player_replay_camera_service().get_status()
+        finally:
+            camera_service.end_maintenance()
+        publish_detection_event(
+            {
+                "type": "camera_selection_applied",
+                "previous_indices": previous_indices,
+                "selected_indices": [int(idx) for idx in settings.camera_indices],
+                "scoring_ready": {str(slot): bool(ready) for slot, ready in readiness.items()},
+                "detection_reset_requested": True,
+                "player_replay": player_replay_status,
+            }
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to apply camera selection: {exc}") from exc
     return {
@@ -472,6 +526,8 @@ def select_camera_devices(payload: dict) -> dict:
         "selected": settings.camera_indices,
         "devices": [c.__dict__ for c in camera_service.list_cameras()],
         "mode": camera_service.mode_status(),
+        "scoring_ready": {str(slot): bool(ready) for slot, ready in readiness.items()},
+        "player_replay": player_replay_status,
         "message": "Camera selection applied. Detection background reset requested.",
     }
 

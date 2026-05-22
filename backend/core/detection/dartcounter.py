@@ -1751,6 +1751,7 @@ def _handle_external_reset(
     st.remove_delay_start = None
     st.remove_started_value = None
     st.takeout_armed = False
+    st.post_reset_guard_until_ms = (time.perf_counter() * 1000.0) + max(1200.0, float(WARMUP_MS))
     raw_last_frame_imgs[:] = list(frames_raw)
     raw_before_movement_imgs[:] = list(frames_raw)
     raw_empty_imgs[:] = list(frames_raw)
@@ -2037,6 +2038,7 @@ def main(camera_service: Optional[CameraService] = None):
     last_state_insights_update = 0.0
     last_perf_insights_update = 0.0
     last_runtime_debug_update = 0.0
+    last_camera_config_generation = camera_service.configuration_generation()
 
     # Full-resolution (raw) frame mirrors for fronton view.
     # These track the same logical frames as st.last_frame_imgs / st.before_movement_imgs /
@@ -2057,6 +2059,15 @@ def main(camera_service: Optional[CameraService] = None):
             frame_i += 1
             if SKIP_EVERY_OTHER_FRAME and (frame_i % 2 == 1):
                 time.sleep(0.001)
+
+            if str(camera_service.mode_status().get("mode", "")) == "switching":
+                _update_detection_insights(
+                    current_state="camera_switching",
+                    result_of_last_detection="camera_switching",
+                    darts_on_board=int(st.dart_count),
+                )
+                time.sleep(0.05)
+                continue
 
             # Read frames
             frames_raw = []
@@ -2127,6 +2138,43 @@ def main(camera_service: Optional[CameraService] = None):
                 frames_gray[j] = gray
                 frames_motion_gray[j] = motion_gray
             diff_threshold_u8 = int(DIFF_THRESHOLD * 255)
+
+            current_camera_config_generation = camera_service.configuration_generation()
+            if current_camera_config_generation != last_camera_config_generation:
+                bump_tip_session()
+                clear_tip_jobs()
+                _handle_external_reset(
+                    st=st,
+                    frames=frames,
+                    frames_gray=frames_gray,
+                    frames_raw=frames_raw,
+                    raw_last_frame_imgs=raw_last_frame_imgs,
+                    raw_before_movement_imgs=raw_before_movement_imgs,
+                    raw_empty_imgs=raw_empty_imgs,
+                    tip_scorer=tip_scorer,
+                )
+                last_camera_config_generation = current_camera_config_generation
+                processed_frame_ts = list(frame_timestamps)
+                last_processed_ts = list(frame_timestamps)
+                processed_frames = list(frames)
+                processed_grays = list(frames_gray)
+                processed_motion_grays = list(frames_motion_gray)
+                _update_detection_insights(
+                    current_state="no_movement",
+                    result_of_last_detection="camera_reconfigured",
+                    darts_on_board=0,
+                )
+                publish_detection_event(
+                    {
+                        "type": "state_changed",
+                        "from_state": state_before_loop,
+                        "to_state": "no_movement",
+                        "darts_on_board": 0,
+                        "reason": "camera_reconfigured",
+                    }
+                )
+                time.sleep(frame_interval_s)
+                continue
 
             # External reset request (e.g. after leaving calibration page):
             # refresh background/baseline from current live frames.
