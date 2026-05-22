@@ -229,6 +229,21 @@ function formatAppliedScore(value: number): string {
   return value === 0 ? "0" : String(value);
 }
 
+function dartScoreFromEvent(data: Record<string, any>, scoreValue: number): DartScore {
+  const raw = data?.score && typeof data.score === "object" ? data.score : {};
+  const rawSegment = raw.segment ?? data?.segment ?? (scoreValue > 0 ? scoreValue : 0);
+  const multiplier = Math.max(0, Math.trunc(Number(raw.multiplier ?? data?.multiplier ?? 1) || 1));
+  const segment = String(rawSegment ?? "0");
+  const zone = String(raw.zone ?? data?.zone ?? (scoreValue <= 0 ? "miss" : multiplier === 3 ? "triple" : multiplier === 2 ? "double" : "single"));
+  return {
+    score: Math.trunc(Number(raw.score ?? data?.score_value ?? scoreValue) || 0),
+    multiplier,
+    segment,
+    zone,
+    confidence: Number(raw.confidence ?? data?.confidence ?? 1) || 1,
+  };
+}
+
 function pickRandomItem<T>(items: T[]): T | null {
   if (!items.length) return null;
   return items[Math.floor(Math.random() * items.length)] ?? null;
@@ -831,6 +846,67 @@ export default function X01GamePage() {
     return Boolean(state.players?.[state.currentPlayer]?.isBot);
   };
 
+  const applyOptimisticDartScore = useCallback((data: Record<string, any>) => {
+    const scoreValue = Math.trunc(Number(data?.score_value ?? data?.score?.score ?? 0) || 0);
+    const eventDartIndex = Math.trunc(Number(data?.dart_index ?? 0) || 0);
+    setX01State((prev) => {
+      if (!prev?.currentTurn || isBotTurn(prev) || prev.turnInputArmed === false) {
+        return prev;
+      }
+
+      const existingDarts = Array.isArray(prev.currentTurn.darts)
+        ? prev.currentTurn.darts
+        : [null, null, null];
+      const existingApplied = Array.isArray(prev.currentTurn.appliedScores)
+        ? prev.currentTurn.appliedScores
+        : [0, 0, 0];
+      const slot =
+        eventDartIndex >= 1 && eventDartIndex <= 3
+          ? eventDartIndex - 1
+          : existingDarts.findIndex((dart) => dart === null);
+      if (slot < 0 || slot > 2) {
+        return prev;
+      }
+
+      const alreadyHasSameScore =
+        existingDarts[slot] !== null && Number(existingApplied[slot] ?? 0) === scoreValue;
+      if (alreadyHasSameScore) {
+        return prev;
+      }
+
+      const darts = [existingDarts[0] ?? null, existingDarts[1] ?? null, existingDarts[2] ?? null];
+      const appliedScores = [
+        Number(existingApplied[0] ?? 0),
+        Number(existingApplied[1] ?? 0),
+        Number(existingApplied[2] ?? 0),
+      ];
+      darts[slot] = dartScoreFromEvent(data, scoreValue);
+      appliedScores[slot] = scoreValue;
+
+      const scored = appliedScores.reduce((sum, value, idx) => sum + (darts[idx] ? Number(value || 0) : 0), 0);
+      const scoreBefore = Number(
+        prev.currentTurn.scoreBefore ??
+          (typeof prev.currentPlayer === "number" ? prev.players?.[prev.currentPlayer]?.score : undefined) ??
+          prev.settings.startScore ??
+          startScore
+      );
+      const dartsUsed = darts.filter((dart) => dart !== null).length;
+      const next: X01State = {
+        ...prev,
+        currentTurn: {
+          ...prev.currentTurn,
+          darts,
+          appliedScores,
+          scored,
+          remaining: scoreBefore - scored,
+          dartsUsed,
+        },
+      };
+      x01StateRef.current = next;
+      return next;
+    });
+  }, [startScore]);
+
   const parseReplayPayload = (
     replay: any,
     queuedAtMs: number,
@@ -1029,6 +1105,7 @@ export default function X01GamePage() {
 
   const handleGameSyncEvent = useCallback((data: Record<string, any>) => {
     if (data?.event === "dart_score") {
+      applyOptimisticDartScore(data);
       if (!replayEnabledRef.current) {
         return true;
       }
@@ -1174,7 +1251,7 @@ export default function X01GamePage() {
       return true;
     }
     return false;
-  }, [triggerGifReactionForState]);
+  }, [applyOptimisticDartScore, triggerGifReactionForState]);
 
   const startX01Game = useCallback(async () => {
     setIsLoading(true);
