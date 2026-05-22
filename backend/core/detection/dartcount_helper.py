@@ -105,6 +105,21 @@ def process_tip_score_job(
         return
 
     timings = tip_result.get("timings", {}) if isinstance(tip_result.get("timings"), dict) else {}
+    timing_bits = []
+    for key, label in (
+        ("extract_masks_ms", "extract"),
+        ("bridge_mask_ms", "bridge"),
+        ("bridged_score_ms", "bridged"),
+        ("raw_score_ms", "raw"),
+        ("selection_ms", "select"),
+        ("result_build_ms", "build"),
+    ):
+        if key in timings:
+            try:
+                timing_bits.append(f"{label}={float(timings.get(key) or 0.0):.1f}")
+            except Exception:
+                pass
+    timing_suffix = f", {' '.join(timing_bits)}" if timing_bits else ""
 
     if bool(tip_result.get("ok")):
         selected_new_tips = tip_result.get("selected_new_tips", [])
@@ -121,7 +136,7 @@ def process_tip_score_job(
         print(
             f"[OPENCV] score -> {voted_value} "
             f"(votes={votes}, zone={voted_score.get('zone', '-')}, "
-            f"proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{miss_suffix})"
+            f"proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{timing_suffix}{miss_suffix})"
         )
 
         if dart_index > 0:
@@ -175,7 +190,10 @@ def process_tip_score_job(
         return
 
     reason = str(tip_result.get("reason", "unknown"))
-    print(f"[OPENCV] score unavailable ({reason}, proc={proc_ms:.2f} ms, total={total_ms:.2f} ms)")
+    print(
+        f"[OPENCV] score unavailable "
+        f"({reason}, proc={proc_ms:.2f} ms, total={total_ms:.2f} ms{timing_suffix})"
+    )
     update_detection_insights(
         last_tip_scoring_ms=round(proc_ms, 2),
         last_tip_preprocess_ms=timings.get("preprocess_ms"),

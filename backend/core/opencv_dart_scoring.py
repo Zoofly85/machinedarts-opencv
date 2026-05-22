@@ -29,12 +29,17 @@ class OpenCvDartScoringService:
             num_cameras=len(settings.camera_indices),
             calibration_dir=settings.calibration_data_dir,
         )
+        self._calibrators_cache: dict[int, object] = {}
+        self._board_centers_cache: dict[int, tuple[float, float]] = {}
+        self._config_cache = DartScoringConfig(camera_calibration_map={})
+        self._refresh_calibration_cache()
 
     def reload_calibration(self) -> None:
         self._cal_manager = get_shared_calibration_manager(
             num_cameras=len(settings.camera_indices),
             calibration_dir=settings.calibration_data_dir,
         )
+        self._refresh_calibration_cache()
 
     def reset_tracks(self) -> None:
         # Kept for compatibility with the existing takeout reset path.
@@ -48,10 +53,19 @@ class OpenCvDartScoringService:
         return {"active_model_id": "opencv-line-fit", "runtime": "opencv"}
 
     def _calibrators(self) -> dict[int, object]:
-        return {
+        if not self._calibrators_cache:
+            self._refresh_calibration_cache()
+        return dict(self._calibrators_cache)
+
+    def _refresh_calibration_cache(self) -> None:
+        self._calibrators_cache = {
             cam_i: item.calibrator
             for cam_i, item in enumerate(getattr(self._cal_manager, "_items", []))
         }
+        self._board_centers_cache = self._board_centers(self._calibrators_cache)
+        self._config_cache = DartScoringConfig(
+            camera_calibration_map={i: i for i in self._calibrators_cache}
+        )
 
     @staticmethod
     def _board_centers(calibrators: dict[int, object]) -> dict[int, tuple[float, float]]:
@@ -121,6 +135,53 @@ class OpenCvDartScoringService:
         if source.startswith("camera_score_consensus") and final_value <= 0:
             rank -= 15
         return rank
+
+    @classmethod
+    def _is_strong_mask_result(cls, result: dict[str, Any]) -> bool:
+        scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
+        source = str(scoring.get("source") or "")
+        if cls._result_score_value(result) <= 0:
+            return False
+        if not (
+            source.startswith("line_cluster")
+            or source.startswith("ellipse_radial_line_fallback")
+        ):
+            return False
+
+        cluster = scoring.get("intersection_consensus")
+        if not isinstance(cluster, dict):
+            cluster = scoring.get("ellipse_radial_intersection_consensus")
+        if not isinstance(cluster, dict):
+            return False
+
+        agreement = int(cluster.get("agreement") or 0)
+        try:
+            spread = float(cluster.get("spread_px") or scoring.get("intersection_spread_px") or 9999.0)
+        except Exception:
+            spread = 9999.0
+        return (agreement >= 3 and spread <= 12.0) or (agreement >= 2 and spread <= 6.0)
+
+    @classmethod
+    def _single_mask_mode_candidates(
+        cls,
+        result: dict[str, Any],
+        *,
+        selected_mode: str,
+        skipped_mode: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
+        rank = cls._score_candidate_rank(result)
+        return {
+            selected_mode: {
+                "rank": int(rank),
+                "score": int(cls._result_score_value(result)),
+                "source": scoring.get("source"),
+                "label": scoring.get("predicted_label"),
+            },
+            skipped_mode: {"skipped": True, "reason": reason},
+            "selected": selected_mode,
+        }
 
     @classmethod
     def _select_mask_mode_result(cls, raw_result: dict[str, Any], bridged_result: dict[str, Any]) -> dict[str, Any]:
@@ -248,28 +309,32 @@ class OpenCvDartScoringService:
 
     def score_masks(self, masks: list[Optional[np.ndarray]], *, dart_index: int = 0) -> dict[str, Any]:
         total_t0 = time.perf_counter()
+        timings: dict[str, Any] = {}
+        t0 = time.perf_counter()
         new_masks = self._extract_new_masks(masks)
+        timings["extract_masks_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
         if not new_masks:
-            return {"ok": False, "reason": "no_new_dart_mask"}
+            timings["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 2)
+            return {"ok": False, "reason": "no_new_dart_mask", "timings": timings}
 
-        calibrators = self._calibrators()
+        t0 = time.perf_counter()
+        calibrators = self._calibrators_cache
         if not calibrators:
-            return {"ok": False, "reason": "no_calibration"}
+            self._refresh_calibration_cache()
+            calibrators = self._calibrators_cache
+        config = self._config_cache
+        board_centers = self._board_centers_cache
+        timings["calibration_cache_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        if not calibrators:
+            timings["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 2)
+            return {"ok": False, "reason": "no_calibration", "timings": timings}
 
-        config = DartScoringConfig(camera_calibration_map={i: i for i in calibrators})
-        board_centers = self._board_centers(calibrators)
         line_strategy = "full_centerline"
-        raw_result = detect_and_score_from_masks(
-            new_masks,
-            calibrators,
-            detection_counter=int(dart_index or 0),
-            config=config,
-            board_centers=board_centers,
-            line_strategy=line_strategy,
-        )
-        raw_result.setdefault("scoring", {})["mask_mode"] = "raw"
-
+        t0 = time.perf_counter()
         bridged_masks = {cam_i: bridge_mask_gaps(mask) for cam_i, mask in new_masks.items()}
+        timings["bridge_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+
+        t0 = time.perf_counter()
         bridged_result = detect_and_score_from_masks(
             bridged_masks,
             calibrators,
@@ -279,19 +344,57 @@ class OpenCvDartScoringService:
             line_strategy=line_strategy,
         )
         bridged_result.setdefault("scoring", {})["mask_mode"] = "bridged"
-        result = self._select_mask_mode_result(raw_result, bridged_result)
+        timings["bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+
+        raw_result: Optional[dict[str, Any]] = None
+        if self._is_strong_mask_result(bridged_result):
+            result = bridged_result
+            scoring_for_mode = result.setdefault("scoring", {})
+            scoring_for_mode["mask_mode_candidates"] = self._single_mask_mode_candidates(
+                result,
+                selected_mode="bridged",
+                skipped_mode="raw",
+                reason="strong_bridged_result",
+            )
+            scoring_for_mode["adaptive_mask_mode"] = {
+                "raw_skipped": True,
+                "reason": "strong_bridged_result",
+            }
+            timings["raw_score_ms"] = 0.0
+            timings["selection_ms"] = 0.0
+        else:
+            t0 = time.perf_counter()
+            raw_result = detect_and_score_from_masks(
+                new_masks,
+                calibrators,
+                detection_counter=int(dart_index or 0),
+                config=config,
+                board_centers=board_centers,
+                line_strategy=line_strategy,
+            )
+            raw_result.setdefault("scoring", {})["mask_mode"] = "raw"
+            timings["raw_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            t0 = time.perf_counter()
+            result = self._select_mask_mode_result(raw_result, bridged_result)
+            result.setdefault("scoring", {})["adaptive_mask_mode"] = {
+                "raw_skipped": False,
+                "reason": "bridged_not_strong",
+            }
+            timings["selection_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
         scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
         final = scoring.get("final") if isinstance(scoring.get("final"), dict) else None
         final_score = final.get("score") if isinstance(final, dict) and isinstance(final.get("score"), dict) else None
         if not isinstance(final_score, dict):
+            timings["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 2)
             return {
                 "ok": False,
                 "reason": "opencv_score_uncertain",
                 "opencv_result": result,
-                "timings": {"total_ms": round((time.perf_counter() - total_t0) * 1000.0, 2)},
+                "timings": timings,
             }
 
+        t0 = time.perf_counter()
         candidates = []
         selected_new_tips = []
         for item in scoring.get("camera_votes", []):
@@ -341,6 +444,21 @@ class OpenCvDartScoringService:
         }
 
         elapsed = round((time.perf_counter() - total_t0) * 1000.0, 2)
+        timings["result_build_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        timings["total_ms"] = elapsed
+        timings["preprocess_ms"] = round(
+            float(timings.get("extract_masks_ms") or 0.0) + float(timings.get("bridge_mask_ms") or 0.0),
+            2,
+        )
+        timings["inference_ms"] = 0.0
+        timings["decode_ms"] = 0.0
+        timings["calibration_ms"] = timings.get("calibration_cache_ms", 0.0)
+        timings["vote_ms"] = round(
+            float(timings.get("bridged_score_ms") or 0.0)
+            + float(timings.get("raw_score_ms") or 0.0)
+            + float(timings.get("selection_ms") or 0.0),
+            2,
+        )
         return {
             "ok": True,
             "active_model_id": "opencv-line-fit",
@@ -351,17 +469,11 @@ class OpenCvDartScoringService:
             "diagnostics": {
                 "camera_count": len(candidates),
                 "opencv_source": scoring.get("source"),
+                "mask_mode": scoring.get("mask_mode"),
+                "adaptive_mask_mode": scoring.get("adaptive_mask_mode"),
             },
             "candidates": candidates,
             "selected_new_tips": selected_new_tips,
             "opencv_result": result,
-            "timings": {
-                "preprocess_ms": 0.0,
-                "inference_ms": 0.0,
-                "decode_ms": 0.0,
-                "selection_ms": 0.0,
-                "calibration_ms": 0.0,
-                "vote_ms": elapsed,
-                "total_ms": elapsed,
-            },
+            "timings": timings,
         }
