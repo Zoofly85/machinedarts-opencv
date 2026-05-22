@@ -122,9 +122,29 @@ export default function PracticePage() {
     [updateScoresFromApi]
   );
 
-  const hasPendingScores = useCallback((list: (DartScore | null)[], count: number) => {
-    if (!list || count <= 0) return false;
-    return list.slice(0, count).some((score) => score == null);
+  const applyScoreEvent = useCallback((data: Record<string, any>) => {
+    const dartIndex = Math.max(0, Math.min(2, Number(data.dart_index ?? 1) - 1));
+    const rawScore = data.score && typeof data.score === "object" ? data.score : {};
+    const scoreValue = Number(data.score_value ?? rawScore.score ?? 0) || 0;
+    const score: DartScore = {
+      score: scoreValue,
+      multiplier: Number(rawScore.multiplier ?? 1) || 1,
+      segment: String(rawScore.segment ?? (scoreValue > 0 ? scoreValue : 0)),
+      zone: String(rawScore.zone ?? (scoreValue <= 0 ? "miss" : "single")),
+      confidence: Number(rawScore.confidence ?? data.votes ?? 1) || 1,
+    };
+
+    setScores((prev) => {
+      const next: (DartScore | null)[] = [prev[0] ?? null, prev[1] ?? null, prev[2] ?? null];
+      next[dartIndex] = score;
+      setTotalScore(next.reduce((sum, item) => sum + (item?.score ?? 0), 0));
+      return next;
+    });
+
+    if (scoreRetryRef.current) {
+      window.clearTimeout(scoreRetryRef.current);
+      scoreRetryRef.current = null;
+    }
   }, []);
 
   // Subscribe to shared detection WebSocket
@@ -143,16 +163,11 @@ export default function PracticePage() {
         } else {
           await fetchImageForSettings();
         }
-
-        const targetIndex = Math.max(0, (data.dart_count ?? dartCount) - 1);
-        try {
-          const latest = await updateScoresFromApi();
-          if (hasPendingScores(latest, (data.dart_count ?? dartCount) || 0)) {
-            scheduleScoreRetry(targetIndex, 12);
-          }
-        } catch (err) {
-          console.error("Error fetching scores after dart detect:", err);
-        }
+      } else if (data.event === 'dart_score') {
+        applyScoreEvent(data);
+      } else if (data.event === 'dart_score_unavailable') {
+        const targetIndex = Math.max(0, Math.min(2, Number(data.dart_index ?? dartCount ?? 1) - 1));
+        scheduleScoreRetry(targetIndex, 3);
       } else if (data.event === 'darts_removed') {
         if (data.image) {
           setCurrentImage(`data:image/jpeg;base64,${data.image}`);
@@ -163,20 +178,8 @@ export default function PracticePage() {
         setScores([]);
         setTotalScore(0);
       } else if (data.event === 'detection_status_update') {
-        // Only fetch if dart count actually changed (using ref to avoid stale closure)
-        if (data.dart_count !== lastDartCountRef.current && data.dart_count > 0) {
+        if (typeof data.dart_count === "number" && data.dart_count !== lastDartCountRef.current) {
           lastDartCountRef.current = data.dart_count;
-          
-          try {
-            // Fetch latest scores
-            const latest = await updateScoresFromApi();
-            if (hasPendingScores(latest, data.dart_count)) {
-              const targetIndex = Math.max(0, data.dart_count - 1);
-              scheduleScoreRetry(targetIndex, 6);
-            }
-          } catch (err) {
-            console.error('Error fetching updated data:', err);
-          }
         }
       }
     });
@@ -201,7 +204,7 @@ export default function PracticePage() {
         window.clearTimeout(scoreRetryRef.current);
       }
     };
-  }, [fetchImageForSettings]);
+  }, [applyScoreEvent, dartCount, fetchImageForSettings, scheduleScoreRetry]);
 
   useEffect(() => {
     fetchImageForSettings();
