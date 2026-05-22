@@ -191,6 +191,7 @@ def main() -> int:
     parser.add_argument("--packs", default=str(ROOT / "backend" / "data" / "correction_debug"))
     parser.add_argument("--output", default=str(ROOT / "backend" / "data" / "calibration_audit" / "mask_diff_dataset_test.json"))
     parser.add_argument("--pack", action="append", default=[], help="Specific pack directory name to test. Can be repeated.")
+    parser.add_argument("--method", action="append", choices=METHODS, default=[], help="Specific mask method to test. Can be repeated.")
     parser.add_argument("--line-strategy", default="tip_refit")
     parser.add_argument("--gray-threshold", type=int, default=24)
     parser.add_argument("--channel-threshold", type=int, default=28)
@@ -202,7 +203,8 @@ def main() -> int:
 
     pack_root = Path(args.packs)
     rows = []
-    totals = {method: 0 for method in METHODS}
+    methods = list(args.method or METHODS)
+    totals = {method: 0 for method in methods}
     evaluated = 0
     selected_packs = set(args.pack or [])
     candidate_packs = sorted(p for p in pack_root.iterdir() if p.is_dir() and (p / "metadata.json").exists())
@@ -218,7 +220,7 @@ def main() -> int:
             continue
         calibrators = _load_calibrators(pack)
         method_results = {}
-        for method in METHODS:
+        for method in methods:
             masks = _build_masks_for_method(
                 pack,
                 method,
@@ -254,6 +256,7 @@ def main() -> int:
     summary = {
         "packs_evaluated": evaluated,
         "line_strategy": args.line_strategy,
+        "methods": methods,
         "thresholds": {
             "gray": args.gray_threshold,
             "channel": args.channel_threshold,
@@ -270,12 +273,12 @@ def main() -> int:
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print(f"packs evaluated: {evaluated}")
-    for method in METHODS:
+    for method in methods:
         print(f"{method}: {totals[method]}/{evaluated}")
     print()
     for row in rows:
         bits = []
-        for method in METHODS:
+        for method in methods:
             result = row["methods"][method]
             mark = "OK" if result["matches"] else "NO"
             bits.append(f"{method}={mark}:{result['label']}")
