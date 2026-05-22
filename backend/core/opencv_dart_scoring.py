@@ -92,6 +92,24 @@ class OpenCvDartScoringService:
         return out
 
     @staticmethod
+    def _bridge_mask_cropped(mask: np.ndarray, padding: int = 48) -> np.ndarray:
+        coords = np.argwhere(mask > 0)
+        if coords.size == 0:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        y0, x0 = coords.min(axis=0)
+        y1, x1 = coords.max(axis=0) + 1
+        h, w = mask.shape[:2]
+        x0 = max(0, int(x0) - int(padding))
+        y0 = max(0, int(y0) - int(padding))
+        x1 = min(w, int(x1) + int(padding))
+        y1 = min(h, int(y1) + int(padding))
+
+        out = np.zeros_like(mask, dtype=np.uint8)
+        out[y0:y1, x0:x1] = bridge_mask_gaps(mask[y0:y1, x0:x1])
+        return out
+
+    @staticmethod
     def _score_value(score: dict[str, Any]) -> int:
         try:
             return int(score.get("score", 0) or 0)
@@ -331,7 +349,7 @@ class OpenCvDartScoringService:
 
         line_strategy = "full_centerline"
         t0 = time.perf_counter()
-        bridged_masks = {cam_i: bridge_mask_gaps(mask) for cam_i, mask in new_masks.items()}
+        bridged_masks = {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in new_masks.items()}
         timings["bridge_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
         t0 = time.perf_counter()
