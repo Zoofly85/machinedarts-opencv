@@ -4,6 +4,7 @@ import time
 from collections import defaultdict
 from typing import Any, Optional
 
+import cv2
 import numpy as np
 
 from backend.config.settings import settings
@@ -14,6 +15,8 @@ from backend.core.opencv_dart_detection.scoring import final_score_key, format_s
 
 
 CODE_NEW = 76
+LAB_L_THRESHOLD = 22
+LAB_AB_THRESHOLD = 10
 
 
 class OpenCvDartScoringService:
@@ -91,6 +94,45 @@ class OpenCvDartScoringService:
                 out[int(cam_i)] = new_mask
         return out
 
+    @classmethod
+    def _extract_lab_masks(
+        cls,
+        frames: list[Optional[np.ndarray]] | None,
+        background_frames: list[Optional[np.ndarray]] | None,
+    ) -> dict[int, np.ndarray]:
+        out: dict[int, np.ndarray] = {}
+        if not frames or not background_frames:
+            return out
+        for cam_i, (frame, background) in enumerate(zip(frames, background_frames)):
+            if not isinstance(frame, np.ndarray) or not isinstance(background, np.ndarray):
+                continue
+            if frame.shape[:2] != background.shape[:2]:
+                continue
+            cur_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            ref_lab = cv2.cvtColor(background, cv2.COLOR_BGR2LAB)
+            diff = cv2.absdiff(cur_lab, ref_lab)
+            mask = (
+                (diff[:, :, 0] > LAB_L_THRESHOLD)
+                | (diff[:, :, 1] > LAB_AB_THRESHOLD)
+                | (diff[:, :, 2] > LAB_AB_THRESHOLD)
+            ).astype(np.uint8) * 255
+            mask = cls._clean_scoring_mask(mask)
+            if int(np.count_nonzero(mask)) > 0:
+                out[int(cam_i)] = mask
+        return out
+
+    @staticmethod
+    def _clean_scoring_mask(mask: np.ndarray, min_pixels: int = 12) -> np.ndarray:
+        if mask is None:
+            return mask
+        mask_u8 = (mask > 0).astype(np.uint8) * 255
+        num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask_u8, 8)
+        out = np.zeros_like(mask_u8)
+        for label in range(1, num_labels):
+            if int(stats[label, cv2.CC_STAT_AREA]) >= int(min_pixels):
+                out[labels == label] = 255
+        return out
+
     @staticmethod
     def _bridge_mask_cropped(mask: np.ndarray, padding: int = 48) -> np.ndarray:
         coords = np.argwhere(mask > 0)
@@ -153,6 +195,126 @@ class OpenCvDartScoringService:
         if source.startswith("camera_score_consensus") and final_value <= 0:
             rank -= 15
         return rank
+
+    @classmethod
+    def _result_agreement_spread(cls, result: dict[str, Any]) -> tuple[int, float]:
+        scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
+        cluster = scoring.get("intersection_consensus")
+        if not isinstance(cluster, dict):
+            cluster = scoring.get("ellipse_radial_intersection_consensus")
+        if not isinstance(cluster, dict):
+            return 0, 9999.0
+        agreement = int(cluster.get("agreement") or 0)
+        try:
+            spread = float(cluster.get("spread_px") or scoring.get("intersection_spread_px") or 9999.0)
+        except Exception:
+            spread = 9999.0
+        return agreement, spread
+
+    @classmethod
+    def _select_scoring_candidate(cls, candidates: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        if not candidates:
+            return {"ok": False, "reason": "no_scoring_candidates"}
+
+        ranked: dict[str, dict[str, Any]] = {}
+        for name, result in candidates.items():
+            scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
+            agreement, spread = cls._result_agreement_spread(result)
+            ranked[name] = {
+                "rank": int(cls._score_candidate_rank(result)),
+                "score": int(cls._result_score_value(result)),
+                "source": scoring.get("source"),
+                "label": scoring.get("predicted_label"),
+                "agreement": int(agreement),
+                "spread": float(spread),
+            }
+
+        selected_name = max(ranked, key=lambda name: ranked[name]["rank"])
+        selected = candidates[selected_name]
+
+        pure_lab = candidates.get("pure_lab")
+        if pure_lab is not None and selected_name == "pure_lab":
+            non_pure_names = [name for name in ranked if name != "pure_lab"]
+            if non_pure_names:
+                best_non_pure_name = max(non_pure_names, key=lambda name: ranked[name]["rank"])
+                best_non_pure = candidates[best_non_pure_name]
+                pure_scoring = pure_lab.get("scoring", {}) if isinstance(pure_lab.get("scoring"), dict) else {}
+                non_pure_scoring = (
+                    best_non_pure.get("scoring", {})
+                    if isinstance(best_non_pure.get("scoring"), dict)
+                    else {}
+                )
+                pure_final = pure_scoring.get("final") if isinstance(pure_scoring.get("final"), dict) else {}
+                non_pure_final = (
+                    non_pure_scoring.get("final")
+                    if isinstance(non_pure_scoring.get("final"), dict)
+                    else {}
+                )
+                pure_score = pure_final.get("score") if isinstance(pure_final.get("score"), dict) else {}
+                non_pure_score = (
+                    non_pure_final.get("score")
+                    if isinstance(non_pure_final.get("score"), dict)
+                    else {}
+                )
+                if (
+                    int(non_pure_score.get("segment") or 0) > 0
+                    and int(non_pure_score.get("segment") or 0) == int(pure_score.get("segment") or 0)
+                    and int(non_pure_score.get("multiplier") or 1) == 3
+                    and int(pure_score.get("multiplier") or 1) == 1
+                ):
+                    selected_name = best_non_pure_name
+                    selected = best_non_pure
+
+        if pure_lab is not None and selected_name != "pure_lab":
+            selected_scoring = selected.get("scoring", {}) if isinstance(selected.get("scoring"), dict) else {}
+            pure_scoring = pure_lab.get("scoring", {}) if isinstance(pure_lab.get("scoring"), dict) else {}
+            selected_source = str(selected_scoring.get("source") or "")
+            pure_source = str(pure_scoring.get("source") or "")
+            selected_agreement, selected_spread = cls._result_agreement_spread(selected)
+            pure_agreement, pure_spread = cls._result_agreement_spread(pure_lab)
+            pure_value = cls._result_score_value(pure_lab)
+            selected_value = cls._result_score_value(selected)
+            selected_final = selected_scoring.get("final") if isinstance(selected_scoring.get("final"), dict) else {}
+            pure_final = pure_scoring.get("final") if isinstance(pure_scoring.get("final"), dict) else {}
+            selected_score = selected_final.get("score") if isinstance(selected_final.get("score"), dict) else {}
+            pure_score = pure_final.get("score") if isinstance(pure_final.get("score"), dict) else {}
+            selected_segment = int(selected_score.get("segment") or 0)
+            pure_segment = int(pure_score.get("segment") or 0)
+            selected_multiplier = int(selected_score.get("multiplier") or 1)
+            pure_multiplier = int(pure_score.get("multiplier") or 1)
+
+            pure_would_downgrade_triple = (
+                selected_segment > 0
+                and selected_segment == pure_segment
+                and selected_multiplier == 3
+                and pure_multiplier == 1
+            )
+
+            pure_has_clean_line = pure_source.startswith("line_cluster") and pure_agreement >= 2 and pure_spread <= 8.0
+            pure_beats_fallback = (
+                selected_source.startswith("ellipse_radial_line_fallback")
+                and pure_value > 0
+                and pure_agreement >= 2
+                and pure_spread + 1.0 < selected_spread
+            )
+            pure_beats_weak_camera_vote = (
+                selected_source.startswith("camera_score_consensus")
+                and pure_value > 0
+                and selected_value > 0
+                and pure_spread + 10.0 < selected_spread
+            )
+            if not pure_would_downgrade_triple and (
+                pure_has_clean_line or pure_beats_fallback or pure_beats_weak_camera_vote
+            ):
+                selected_name = "pure_lab"
+                selected = pure_lab
+
+        scoring = selected.setdefault("scoring", {})
+        scoring["mask_mode_candidates"] = {
+            **ranked,
+            "selected": selected_name,
+        }
+        return selected
 
     @classmethod
     def _is_strong_mask_result(cls, result: dict[str, Any]) -> bool:
@@ -325,7 +487,14 @@ class OpenCvDartScoringService:
         upgraded["scoring"] = upgraded_scoring
         return upgraded
 
-    def score_masks(self, masks: list[Optional[np.ndarray]], *, dart_index: int = 0) -> dict[str, Any]:
+    def score_masks(
+        self,
+        masks: list[Optional[np.ndarray]],
+        *,
+        dart_index: int = 0,
+        frames: list[Optional[np.ndarray]] | None = None,
+        background_frames: list[Optional[np.ndarray]] | None = None,
+    ) -> dict[str, Any]:
         total_t0 = time.perf_counter()
         timings: dict[str, Any] = {}
         t0 = time.perf_counter()
@@ -365,7 +534,13 @@ class OpenCvDartScoringService:
         timings["bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
         raw_result: Optional[dict[str, Any]] = None
-        if self._is_strong_mask_result(bridged_result):
+        pure_lab_result: Optional[dict[str, Any]] = None
+        should_try_pure_lab = not self._is_strong_mask_result(bridged_result)
+        bridged_source = str((bridged_result.get("scoring") or {}).get("source") or "")
+        if bridged_source.startswith("ellipse_radial_line_fallback"):
+            should_try_pure_lab = True
+
+        if self._is_strong_mask_result(bridged_result) and not should_try_pure_lab:
             result = bridged_result
             scoring_for_mode = result.setdefault("scoring", {})
             scoring_for_mode["mask_mode_candidates"] = self._single_mask_mode_candidates(
@@ -379,6 +554,8 @@ class OpenCvDartScoringService:
                 "reason": "strong_bridged_result",
             }
             timings["raw_score_ms"] = 0.0
+            timings["pure_lab_mask_ms"] = 0.0
+            timings["pure_lab_score_ms"] = 0.0
             timings["selection_ms"] = 0.0
         else:
             t0 = time.perf_counter()
@@ -392,11 +569,37 @@ class OpenCvDartScoringService:
             )
             raw_result.setdefault("scoring", {})["mask_mode"] = "raw"
             timings["raw_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+
             t0 = time.perf_counter()
-            result = self._select_mask_mode_result(raw_result, bridged_result)
+            pure_lab_masks = self._extract_lab_masks(frames, background_frames)
+            timings["pure_lab_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            if pure_lab_masks:
+                t0 = time.perf_counter()
+                pure_lab_result = detect_and_score_from_masks(
+                    pure_lab_masks,
+                    calibrators,
+                    detection_counter=int(dart_index or 0),
+                    config=config,
+                    board_centers=board_centers,
+                    line_strategy=line_strategy,
+                )
+                pure_lab_result.setdefault("scoring", {})["mask_mode"] = "pure_lab"
+                timings["pure_lab_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            else:
+                timings["pure_lab_score_ms"] = 0.0
+
+            t0 = time.perf_counter()
+            result = self._select_scoring_candidate(
+                {
+                    "bridged": bridged_result,
+                    "raw": raw_result,
+                    **({"pure_lab": pure_lab_result} if pure_lab_result is not None else {}),
+                }
+            )
             result.setdefault("scoring", {})["adaptive_mask_mode"] = {
                 "raw_skipped": False,
-                "reason": "bridged_not_strong",
+                "pure_lab_scored": pure_lab_result is not None,
+                "reason": "bridged_not_strong_or_fallback",
             }
             timings["selection_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -474,6 +677,7 @@ class OpenCvDartScoringService:
         timings["vote_ms"] = round(
             float(timings.get("bridged_score_ms") or 0.0)
             + float(timings.get("raw_score_ms") or 0.0)
+            + float(timings.get("pure_lab_score_ms") or 0.0)
             + float(timings.get("selection_ms") or 0.0),
             2,
         )

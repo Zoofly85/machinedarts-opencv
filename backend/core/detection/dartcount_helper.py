@@ -109,7 +109,12 @@ def process_tip_score_job(
         return
 
     proc_t0 = time.perf_counter()
-    tip_result = tip_scorer.score_masks(job.get("masks") or [], dart_index=int(job.get("dart_index", 0)))
+    tip_result = tip_scorer.score_masks(
+        job.get("masks") or [],
+        dart_index=int(job.get("dart_index", 0)),
+        frames=job.get("frames") or [],
+        background_frames=job.get("background_frames") or [],
+    )
     proc_ms = (time.perf_counter() - proc_t0) * 1000.0
     total_ms = (time.perf_counter() - float(job["event_t0"])) * 1000.0
     queue_wait_ms = (proc_t0 - float(job["event_t0"])) * 1000.0
@@ -130,6 +135,8 @@ def process_tip_score_job(
         ("bridge_mask_ms", "bridge"),
         ("bridged_score_ms", "bridged"),
         ("raw_score_ms", "raw"),
+        ("pure_lab_mask_ms", "labmask"),
+        ("pure_lab_score_ms", "labscore"),
         ("selection_ms", "select"),
         ("result_build_ms", "build"),
     ):
