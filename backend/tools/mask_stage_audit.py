@@ -217,16 +217,42 @@ def main() -> int:
         packs = [p for p in packs if p.name in selected]
 
     rows = []
+    totals: dict[str, dict[str, Any]] = {}
     for pack in packs:
         meta = json.loads((pack / "metadata.json").read_text(encoding="utf-8"))
         corrected = meta.get("corrected_score") if isinstance(meta.get("corrected_score"), dict) else None
+        if corrected is None and bool(meta.get("assumed_correct")):
+            corrected = meta.get("original_score") if isinstance(meta.get("original_score"), dict) else None
         corrected_key = _norm_key(corrected)
+        if corrected_key is None:
+            continue
         calibrators = _load_calibrators(pack)
         stages = _build_stage_masks(pack)
         stage_results = [
             _score_stage(stage_name, masks, calibrators, corrected_key, args.line_strategy)
             for stage_name, masks in stages.items()
         ]
+        for stage in stage_results:
+            name = str(stage.get("stage") or "")
+            bucket = totals.setdefault(
+                name,
+                {
+                    "matches": 0,
+                    "evaluated": 0,
+                    "no_mask": 0,
+                    "source_counts": {},
+                    "label_counts": {},
+                },
+            )
+            bucket["evaluated"] += 1
+            if stage.get("label") == "NO_MASK":
+                bucket["no_mask"] += 1
+            if bool(stage.get("matches")):
+                bucket["matches"] += 1
+            source = str(stage.get("source") or "unknown")
+            label = str(stage.get("label") or "unknown")
+            bucket["source_counts"][source] = int(bucket["source_counts"].get(source, 0)) + 1
+            bucket["label_counts"][label] = int(bucket["label_counts"].get(label, 0)) + 1
         rows.append(
             {
                 "pack": pack.name,
@@ -238,7 +264,14 @@ def main() -> int:
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"rows": rows}, indent=2), encoding="utf-8")
+    out.write_text(json.dumps({"summary": totals, "rows": rows}, indent=2), encoding="utf-8")
+
+    print(f"packs evaluated: {len(rows)}")
+    for name, bucket in sorted(totals.items()):
+        evaluated = int(bucket.get("evaluated") or 0)
+        matches = int(bucket.get("matches") or 0)
+        pct = (matches / evaluated * 100.0) if evaluated else 0.0
+        print(f"{name:<22} {matches:>4}/{evaluated:<4} {pct:>6.2f}% no_mask={bucket.get('no_mask', 0)}")
 
     for row in rows:
         print(f"\n{row['pack']} corrected={row['corrected']} strategy={row['line_strategy']}")
