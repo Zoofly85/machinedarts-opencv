@@ -317,6 +317,52 @@ class OpenCvDartScoringService:
         return selected
 
     @classmethod
+    def _has_same_segment_triple_risk(cls, *results: dict[str, Any] | None) -> bool:
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
+            final = scoring.get("final") if isinstance(scoring.get("final"), dict) else {}
+            final_score = final.get("score") if isinstance(final.get("score"), dict) else {}
+            try:
+                final_segment = int(final_score.get("segment") or 0)
+                final_multiplier = int(final_score.get("multiplier") or 1)
+            except Exception:
+                final_segment = 0
+                final_multiplier = 1
+            if final_segment <= 0 or final_multiplier != 1:
+                continue
+            source = str(scoring.get("source") or "")
+            agreement, spread = cls._result_agreement_spread(result)
+            boundary_like = (
+                (source.startswith("line_cluster") and agreement <= 2 and spread >= 8.0)
+                or source.startswith("camera_score_consensus")
+                or source.startswith("ellipse_radial_line_fallback")
+                or source in {"single_pair_tip_rescue", "triple_boundary_upgrade"}
+            )
+            if not boundary_like:
+                continue
+            for vote in scoring.get("camera_votes", []) or []:
+                score = vote.get("score") if isinstance(vote, dict) else None
+                if not isinstance(score, dict):
+                    continue
+                try:
+                    if int(score.get("segment") or 0) == final_segment and int(score.get("multiplier") or 1) == 3:
+                        return True
+                except Exception:
+                    continue
+            for item in scoring.get("intersections", []) or []:
+                score = item.get("score") if isinstance(item, dict) else None
+                if not isinstance(score, dict):
+                    continue
+                try:
+                    if int(score.get("segment") or 0) == final_segment and int(score.get("multiplier") or 1) == 3:
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    @classmethod
     def _is_strong_mask_result(cls, result: dict[str, Any]) -> bool:
         scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
         source = str(scoring.get("source") or "")
@@ -535,6 +581,7 @@ class OpenCvDartScoringService:
 
         raw_result: Optional[dict[str, Any]] = None
         pure_lab_result: Optional[dict[str, Any]] = None
+        lab_bridged_result: Optional[dict[str, Any]] = None
         should_try_pure_lab = not self._is_strong_mask_result(bridged_result)
         bridged_source = str((bridged_result.get("scoring") or {}).get("source") or "")
         if bridged_source.startswith("ellipse_radial_line_fallback"):
@@ -585,8 +632,24 @@ class OpenCvDartScoringService:
                 )
                 pure_lab_result.setdefault("scoring", {})["mask_mode"] = "pure_lab"
                 timings["pure_lab_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+
+                if self._has_same_segment_triple_risk(bridged_result, raw_result, pure_lab_result):
+                    t0 = time.perf_counter()
+                    lab_bridged_result = detect_and_score_from_masks(
+                        {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in pure_lab_masks.items()},
+                        calibrators,
+                        detection_counter=int(dart_index or 0),
+                        config=config,
+                        board_centers=board_centers,
+                        line_strategy=line_strategy,
+                    )
+                    lab_bridged_result.setdefault("scoring", {})["mask_mode"] = "lab_bridged"
+                    timings["lab_bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                else:
+                    timings["lab_bridged_score_ms"] = 0.0
             else:
                 timings["pure_lab_score_ms"] = 0.0
+                timings["lab_bridged_score_ms"] = 0.0
 
             t0 = time.perf_counter()
             result = self._select_scoring_candidate(
@@ -594,11 +657,13 @@ class OpenCvDartScoringService:
                     "bridged": bridged_result,
                     "raw": raw_result,
                     **({"pure_lab": pure_lab_result} if pure_lab_result is not None else {}),
+                    **({"lab_bridged": lab_bridged_result} if lab_bridged_result is not None else {}),
                 }
             )
             result.setdefault("scoring", {})["adaptive_mask_mode"] = {
                 "raw_skipped": False,
                 "pure_lab_scored": pure_lab_result is not None,
+                "lab_bridged_scored": lab_bridged_result is not None,
                 "reason": "bridged_not_strong_or_fallback",
             }
             timings["selection_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -678,6 +743,7 @@ class OpenCvDartScoringService:
             float(timings.get("bridged_score_ms") or 0.0)
             + float(timings.get("raw_score_ms") or 0.0)
             + float(timings.get("pure_lab_score_ms") or 0.0)
+            + float(timings.get("lab_bridged_score_ms") or 0.0)
             + float(timings.get("selection_ms") or 0.0),
             2,
         )

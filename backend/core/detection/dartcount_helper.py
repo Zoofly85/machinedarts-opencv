@@ -137,6 +137,7 @@ def process_tip_score_job(
         ("raw_score_ms", "raw"),
         ("pure_lab_mask_ms", "labmask"),
         ("pure_lab_score_ms", "labscore"),
+        ("lab_bridged_score_ms", "labbridge"),
         ("selection_ms", "select"),
         ("result_build_ms", "build"),
     ):
