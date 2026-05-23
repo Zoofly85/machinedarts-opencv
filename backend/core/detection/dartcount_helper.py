@@ -184,6 +184,7 @@ def process_tip_score_job(
                 burst_frames=job.get("burst_frames", []),
                 masks=job.get("masks", []),
                 opencv_result=tip_result.get("opencv_result"),
+                scoring_timings=timings,
                 processing_ms=proc_ms,
                 total_ms=total_ms,
                 miss_reason=miss_reason,

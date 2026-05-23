@@ -408,6 +408,7 @@ def _write_temp_round_dart_pack(entry: dict) -> str | None:
             "votes": int(entry.get("votes", 0) or 0),
             "candidates": entry.get("candidates", []) or [],
             "opencv_result": entry.get("opencv_result", {}) or {},
+            "scoring_timings": entry.get("scoring_timings", {}) or {},
             "processing_ms": float(entry.get("processing_ms", 0.0) or 0.0),
             "total_ms": float(entry.get("total_ms", 0.0) or 0.0),
             "miss_reason": entry.get("miss_reason"),
@@ -850,6 +851,7 @@ def record_round_dart_result(
     burst_frames: Optional[list] = None,
     masks: Optional[list] = None,
     opencv_result: Optional[dict] = None,
+    scoring_timings: Optional[dict] = None,
     miss_reason: Optional[str] = None,
     frames_are_owned: bool = False,
     background_frames_are_owned: bool = False,
@@ -886,6 +888,7 @@ def record_round_dart_result(
         "burst_frames": stored_burst_frames,
         "masks": stored_masks,
         "opencv_result": dict(opencv_result or {}),
+        "scoring_timings": dict(scoring_timings or {}),
         "processing_ms": float(processing_ms),
         "total_ms": float(total_ms),
         "miss_reason": str(miss_reason) if miss_reason else None,
@@ -924,6 +927,7 @@ def _copy_round_entry(entry: dict) -> dict:
     ]
     out["masks"] = [m.copy() if isinstance(m, np.ndarray) else None for m in entry.get("masks", [])]
     out["opencv_result"] = dict(entry.get("opencv_result", {}) or {})
+    out["scoring_timings"] = dict(entry.get("scoring_timings", {}) or {})
     return out
 
 
