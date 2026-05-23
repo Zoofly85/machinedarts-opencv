@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from typing import Any, Optional
@@ -17,6 +18,8 @@ from backend.core.opencv_dart_detection.scoring import final_score_key, format_s
 CODE_NEW = 76
 LAB_L_THRESHOLD = 22
 LAB_AB_THRESHOLD = 10
+SCORING_MASK_MODE = str(os.getenv("MACHINE_DARTS_SCORING_MASK_MODE", "rebuilt_lab_only")).strip().lower()
+SCORING_LINE_STRATEGY = str(os.getenv("MACHINE_DARTS_LINE_STRATEGY", "tip_refit")).strip().lower()
 
 
 class OpenCvDartScoringService:
@@ -562,111 +565,150 @@ class OpenCvDartScoringService:
             timings["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 2)
             return {"ok": False, "reason": "no_calibration", "timings": timings}
 
-        line_strategy = "tip_refit"
-        t0 = time.perf_counter()
-        bridged_masks = {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in new_masks.items()}
-        timings["bridge_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
-
-        t0 = time.perf_counter()
-        bridged_result = detect_and_score_from_masks(
-            bridged_masks,
-            calibrators,
-            detection_counter=int(dart_index or 0),
-            config=config,
-            board_centers=board_centers,
-            line_strategy=line_strategy,
-        )
-        bridged_result.setdefault("scoring", {})["mask_mode"] = "bridged"
-        timings["bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
-
-        raw_result: Optional[dict[str, Any]] = None
-        pure_lab_result: Optional[dict[str, Any]] = None
-        lab_bridged_result: Optional[dict[str, Any]] = None
-        should_try_pure_lab = not self._is_strong_mask_result(bridged_result)
-        bridged_source = str((bridged_result.get("scoring") or {}).get("source") or "")
-        if bridged_source.startswith("ellipse_radial_line_fallback"):
-            should_try_pure_lab = True
-
-        if self._is_strong_mask_result(bridged_result) and not should_try_pure_lab:
-            result = bridged_result
-            scoring_for_mode = result.setdefault("scoring", {})
-            scoring_for_mode["mask_mode_candidates"] = self._single_mask_mode_candidates(
-                result,
-                selected_mode="bridged",
-                skipped_mode="raw",
-                reason="strong_bridged_result",
-            )
-            scoring_for_mode["adaptive_mask_mode"] = {
-                "raw_skipped": True,
-                "reason": "strong_bridged_result",
-            }
-            timings["raw_score_ms"] = 0.0
-            timings["pure_lab_mask_ms"] = 0.0
-            timings["pure_lab_score_ms"] = 0.0
-            timings["selection_ms"] = 0.0
-        else:
+        line_strategy = SCORING_LINE_STRATEGY or "tip_refit"
+        if SCORING_MASK_MODE in {"rebuilt_lab_only", "pure_lab_only", "lab_only"}:
             t0 = time.perf_counter()
-            raw_result = detect_and_score_from_masks(
-                new_masks,
+            pure_lab_masks = self._extract_lab_masks(frames, background_frames)
+            timings["pure_lab_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            timings["bridge_mask_ms"] = 0.0
+            timings["bridged_score_ms"] = 0.0
+            timings["raw_score_ms"] = 0.0
+            timings["lab_bridged_score_ms"] = 0.0
+            if not pure_lab_masks:
+                timings["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 2)
+                return {"ok": False, "reason": "no_pure_lab_mask", "timings": timings}
+
+            t0 = time.perf_counter()
+            result = detect_and_score_from_masks(
+                pure_lab_masks,
                 calibrators,
                 detection_counter=int(dart_index or 0),
                 config=config,
                 board_centers=board_centers,
                 line_strategy=line_strategy,
             )
-            raw_result.setdefault("scoring", {})["mask_mode"] = "raw"
-            timings["raw_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            result.setdefault("scoring", {})["mask_mode"] = "pure_lab"
+            scoring_for_mode = result.setdefault("scoring", {})
+            scoring_for_mode["mask_mode_candidates"] = self._single_mask_mode_candidates(
+                result,
+                selected_mode="pure_lab",
+                skipped_mode="adaptive",
+                reason="rebuilt_lab_only",
+            )
+            scoring_for_mode["adaptive_mask_mode"] = {
+                "raw_skipped": True,
+                "pure_lab_scored": True,
+                "lab_bridged_scored": False,
+                "reason": "rebuilt_lab_only",
+            }
+            timings["pure_lab_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            timings["selection_ms"] = 0.0
+        else:
+            t0 = time.perf_counter()
+            bridged_masks = {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in new_masks.items()}
+            timings["bridge_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
             t0 = time.perf_counter()
-            pure_lab_masks = self._extract_lab_masks(frames, background_frames)
-            timings["pure_lab_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
-            if pure_lab_masks:
+            bridged_result = detect_and_score_from_masks(
+                bridged_masks,
+                calibrators,
+                detection_counter=int(dart_index or 0),
+                config=config,
+                board_centers=board_centers,
+                line_strategy=line_strategy,
+            )
+            bridged_result.setdefault("scoring", {})["mask_mode"] = "bridged"
+            timings["bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+
+            raw_result: Optional[dict[str, Any]] = None
+            pure_lab_result: Optional[dict[str, Any]] = None
+            lab_bridged_result: Optional[dict[str, Any]] = None
+            should_try_pure_lab = not self._is_strong_mask_result(bridged_result)
+            bridged_source = str((bridged_result.get("scoring") or {}).get("source") or "")
+            if bridged_source.startswith("ellipse_radial_line_fallback"):
+                should_try_pure_lab = True
+
+            if self._is_strong_mask_result(bridged_result) and not should_try_pure_lab:
+                result = bridged_result
+                scoring_for_mode = result.setdefault("scoring", {})
+                scoring_for_mode["mask_mode_candidates"] = self._single_mask_mode_candidates(
+                    result,
+                    selected_mode="bridged",
+                    skipped_mode="raw",
+                    reason="strong_bridged_result",
+                )
+                scoring_for_mode["adaptive_mask_mode"] = {
+                    "raw_skipped": True,
+                    "reason": "strong_bridged_result",
+                }
+                timings["raw_score_ms"] = 0.0
+                timings["pure_lab_mask_ms"] = 0.0
+                timings["pure_lab_score_ms"] = 0.0
+                timings["lab_bridged_score_ms"] = 0.0
+                timings["selection_ms"] = 0.0
+            else:
                 t0 = time.perf_counter()
-                pure_lab_result = detect_and_score_from_masks(
-                    pure_lab_masks,
+                raw_result = detect_and_score_from_masks(
+                    new_masks,
                     calibrators,
                     detection_counter=int(dart_index or 0),
                     config=config,
                     board_centers=board_centers,
                     line_strategy=line_strategy,
                 )
-                pure_lab_result.setdefault("scoring", {})["mask_mode"] = "pure_lab"
-                timings["pure_lab_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                raw_result.setdefault("scoring", {})["mask_mode"] = "raw"
+                timings["raw_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
-                if self._has_same_segment_triple_risk(bridged_result, raw_result, pure_lab_result):
+                t0 = time.perf_counter()
+                pure_lab_masks = self._extract_lab_masks(frames, background_frames)
+                timings["pure_lab_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                if pure_lab_masks:
                     t0 = time.perf_counter()
-                    lab_bridged_result = detect_and_score_from_masks(
-                        {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in pure_lab_masks.items()},
+                    pure_lab_result = detect_and_score_from_masks(
+                        pure_lab_masks,
                         calibrators,
                         detection_counter=int(dart_index or 0),
                         config=config,
                         board_centers=board_centers,
                         line_strategy=line_strategy,
                     )
-                    lab_bridged_result.setdefault("scoring", {})["mask_mode"] = "lab_bridged"
-                    timings["lab_bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
-                else:
-                    timings["lab_bridged_score_ms"] = 0.0
-            else:
-                timings["pure_lab_score_ms"] = 0.0
-                timings["lab_bridged_score_ms"] = 0.0
+                    pure_lab_result.setdefault("scoring", {})["mask_mode"] = "pure_lab"
+                    timings["pure_lab_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
-            t0 = time.perf_counter()
-            result = self._select_scoring_candidate(
-                {
-                    "bridged": bridged_result,
-                    "raw": raw_result,
-                    **({"pure_lab": pure_lab_result} if pure_lab_result is not None else {}),
-                    **({"lab_bridged": lab_bridged_result} if lab_bridged_result is not None else {}),
+                    if self._has_same_segment_triple_risk(bridged_result, raw_result, pure_lab_result):
+                        t0 = time.perf_counter()
+                        lab_bridged_result = detect_and_score_from_masks(
+                            {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in pure_lab_masks.items()},
+                            calibrators,
+                            detection_counter=int(dart_index or 0),
+                            config=config,
+                            board_centers=board_centers,
+                            line_strategy=line_strategy,
+                        )
+                        lab_bridged_result.setdefault("scoring", {})["mask_mode"] = "lab_bridged"
+                        timings["lab_bridged_score_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                    else:
+                        timings["lab_bridged_score_ms"] = 0.0
+                else:
+                    timings["pure_lab_score_ms"] = 0.0
+                    timings["lab_bridged_score_ms"] = 0.0
+
+                t0 = time.perf_counter()
+                result = self._select_scoring_candidate(
+                    {
+                        "bridged": bridged_result,
+                        "raw": raw_result,
+                        **({"pure_lab": pure_lab_result} if pure_lab_result is not None else {}),
+                        **({"lab_bridged": lab_bridged_result} if lab_bridged_result is not None else {}),
+                    }
+                )
+                result.setdefault("scoring", {})["adaptive_mask_mode"] = {
+                    "raw_skipped": False,
+                    "pure_lab_scored": pure_lab_result is not None,
+                    "lab_bridged_scored": lab_bridged_result is not None,
+                    "reason": "bridged_not_strong_or_fallback",
                 }
-            )
-            result.setdefault("scoring", {})["adaptive_mask_mode"] = {
-                "raw_skipped": False,
-                "pure_lab_scored": pure_lab_result is not None,
-                "lab_bridged_scored": lab_bridged_result is not None,
-                "reason": "bridged_not_strong_or_fallback",
-            }
-            timings["selection_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                timings["selection_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
 
         scoring = result.get("scoring", {}) if isinstance(result.get("scoring"), dict) else {}
         final = scoring.get("final") if isinstance(scoring.get("final"), dict) else None
