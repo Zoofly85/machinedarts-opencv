@@ -99,6 +99,7 @@ def _score_pack(pack: Path, strategy: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--packs", default=str(ROOT / "backend" / "data" / "correction_debug"))
+    parser.add_argument("--pack", action="append", default=[], help="Specific pack directory name to test. Can be repeated.")
     parser.add_argument("--include-known-bad-labels", action="store_true")
     parser.add_argument("--output", default=str(ROOT / "backend" / "data" / "calibration_audit" / "line_fit_dataset_test.json"))
     args = parser.parse_args()
@@ -107,7 +108,11 @@ def main() -> int:
     rows = []
     totals = {strategy: 0 for strategy in STRATEGIES}
     evaluated = 0
-    for pack in sorted(p for p in pack_root.iterdir() if p.is_dir() and (p / "metadata.json").exists()):
+    selected_packs = set(args.pack or [])
+    candidate_packs = sorted(p for p in pack_root.iterdir() if p.is_dir() and (p / "metadata.json").exists())
+    if selected_packs:
+        candidate_packs = [p for p in candidate_packs if p.name in selected_packs]
+    for pack in candidate_packs:
         if not args.include_known_bad_labels and pack.name in IGNORE_BY_DEFAULT:
             continue
         meta = json.loads((pack / "metadata.json").read_text(encoding="utf-8"))
