@@ -347,7 +347,7 @@ class OpenCvDartScoringService:
             timings["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 2)
             return {"ok": False, "reason": "no_calibration", "timings": timings}
 
-        line_strategy = "full_centerline"
+        line_strategy = "tip_refit"
         t0 = time.perf_counter()
         bridged_masks = {cam_i: self._bridge_mask_cropped(mask) for cam_i, mask in new_masks.items()}
         timings["bridge_mask_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
