@@ -37,6 +37,10 @@ class CalibrationManager:
         status = self._items[camera_index].calibrator.get_calibration_status()
         return {**status, "camera_index": camera_index}
 
+    def calibrators(self, limit: int | None = None) -> list[DartboardCalibrator]:
+        items = self._items if limit is None else self._items[: max(0, int(limit))]
+        return [item.calibrator for item in items]
+
     def score(self, camera_index: int, x: float, y: float) -> dict[str, Any]:
         calibrator = self._items[camera_index].calibrator
         # Force ellipse/radial scoring path by ensuring ellipse calibration is preferred.
